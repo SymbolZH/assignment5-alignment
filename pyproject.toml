@@ -3,7 +3,7 @@ name = "alignment"
 version = "1.0.0"
 description = "CS 336 Spring 2026 Assignment 5: Reasoning RL"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"  # Python 3.13 not yet supported for some deps
+requires-python = ">=3.11,<3.13"  # CANN 8.3.RC1 torch-npu wheels require Python <=3.11
 dependencies = [
     "accelerate>=1.5.2",
     "math-verify[antlr4-13-2]>=0.7.0",
@@ -17,6 +17,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+npu = [
+    "torch==2.8.0",
+    "torch-npu==2.8.0",
+    # Python dependencies used by the system CANN toolkit.
+    "numpy>=1.26.4,<2",
+    "attrs",
+    "decorator",
+    "scipy",
+    "cloudpickle",
+    "ml-dtypes<0.6",  # 0.6+ requires NumPy 2
+    "tornado",
+    "absl-py",
+]
 gpu = [
     "alpaca-eval>=0.6.6",
     # No official flash-attn 2.8.3 wheel exists for Torch 2.10; use the
