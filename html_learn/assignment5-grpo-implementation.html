@@ -1,0 +1,470 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>实现同策略 GRPO · 作业 5 详细说明</title><link rel="stylesheet" href="assets/katex/katex.min.css"><link rel="stylesheet" href="assets/assignment5-reader.css"><script src="assets/assignment5-reader.js" defer></script></head><body><div class="reader-layout"><aside class="reader-sidebar"><div class="brand">CS336 / ASSIGNMENT 5</div><a class="back-link" data-back-link href="assignment5-requirements.html#tokenize_prompt_and_output">← 返回任务总览</a><div class="nav-caption">完整模块</div><nav aria-label="模块切换"><a class="module-link" href="assignment5-background.html">背景与符号<small>第 1–2 节</small></a><a class="module-link" href="assignment5-prompting.html">提示与评估基线<small>第 3 节</small></a><a class="module-link" href="assignment5-grpo-theory.html">同策略 GRPO 推导<small>第 4.1 节</small></a><a class="module-link" href="assignment5-grpo-implementation.html" aria-current="page">实现同策略 GRPO<small>第 4.2 节</small></a><a class="module-link" href="assignment5-grpo-experiments.html">标准 GRPO 实验<small>第 4.3 节</small></a><a class="module-link" href="assignment5-on-policy-variants.html">同策略算法变体<small>第 5 节</small></a><a class="module-link" href="assignment5-off-policy.html">异策略强化学习<small>第 6 节</small></a><a class="module-link" href="assignment5-custom-estimator.html">自己的估计器与参考文献<small>第 7 节 / 参考文献</small></a><a class="module-link" href="assignment5-safety-supplement.html">安全对齐与 RLHF（可选）<small>完全可选补充</small></a></nav><details open><summary>本页目录 · 点击题目定位</summary><nav aria-label="本页目录"><a class="toc-link" href="#section-1">4.2 实现同策略 GRPO</a><a class="toc-link" href="#section-2">4.2.1 使用 Hugging Face 模型</a><a class="toc-link task-entry" href="#tokenize_prompt_and_output">题目（tokenize_prompt_and_output）：提示与输出分词（1 分）</a><a class="toc-link task-entry" href="#get_response_log_probs">题目（get_response_log_probs）：回答的对数概率与熵（1 分）</a><a class="toc-link" href="#section-5">4.2.2 在强化学习循环中使用 vLLM</a><a class="toc-link" href="#section-6">4.2.3 GRPO 组件</a><a class="toc-link task-entry" href="#compute_rollout_rewards">题目（compute_rollout_rewards）：计算 rollout 奖励（1 分）</a><a class="toc-link task-entry" href="#compute_group_normalized_rewards_grpo">题目（compute_group_normalized_rewards_grpo）：组归一化（1 分）</a><a class="toc-link task-entry" href="#compute_policy_gradient_loss_on_policy">题目（compute_policy_gradient_loss_on_policy）：同策略策略梯度（1 分）</a><a class="toc-link task-entry" href="#aggregate_loss_across_microbatch_sequence">题目（aggregate_loss_across_microbatch_sequence）：跨 token 和序列聚合 loss（0.5 分）</a><a class="toc-link" href="#section-11">4.2.4 GRPO 训练步骤</a><a class="toc-link task-entry" href="#grpo_train_step_standard_on_policy">题目（grpo_train_step_standard_on_policy）：GRPO 训练步骤（5 分）</a></nav></details></aside><main class="reader-main"><header class="reader-header"><div class="eyebrow">第 4.2 节 / 完整中文说明</div><h1>实现同策略 GRPO</h1><p>来源：<code>translations/assignment5_alignment_zh.md</code>。保留原文要求、推导、示例代码与参数说明。</p><a class="jump-context" href="#module-start">↑ 从本模块开头阅读上下文</a></header><article class="prose" id="module-start"><h2 id="section-1">4.2 实现同策略 GRPO</h2>
+<h3 id="section-2">4.2.1 使用 Hugging Face 模型</h3>
+<p>此前作业使用 <code>cs336_basics</code> 中自行实现的语言模型，本作业直接使用 Hugging Face 的 <code>transformers</code> 库加载预训练基础模型。你也可以自行实现 Transformer 和预训练权重加载器，只需确保架构与 OLMo-2-0425-1B 一致。</p>
+<p>以下起始代码位于 <code>cs336_alignment/checkpoint.py</code>，以 bfloat16 和 FlashAttention-2 加载模型以节省显存：</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+def get_model_and_tokenizer(model_id_or_dir: str, device: str):
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id_or_dir,
+        device_map=device,
+        torch_dtype=torch.bfloat16,
+        attn_implementation=&quot;eager&quot; if device==&#x27;cpu&#x27; else &quot;flash_attention_2&quot;,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_id_or_dir)
+    return model, tokenizer
+"><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span> <span class="n">AutoTokenizer</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">get_model_and_tokenizer</span><span class="p">(</span><span class="n">model_id_or_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+        <span class="n">model_id_or_dir</span><span class="p">,</span>
+        <span class="n">device_map</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+        <span class="n">torch_dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
+        <span class="n">attn_implementation</span><span class="o">=</span><span class="s2">"eager"</span> <span class="k">if</span> <span class="n">device</span><span class="o">==</span><span class="s1">'cpu'</span> <span class="k">else</span> <span class="s2">"flash_attention_2"</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">tokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model_id_or_dir</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">model</span><span class="p">,</span> <span class="n">tokenizer</span>
+</code></pre></figure>
+<p>模型标识可以是 <code>allenai/OLMo-2-0425-1B</code> 这样的名称，也可以是目录路径。目录通常由 <code>save_pretrained</code> 生成。训练后可这样保存模型：</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="# 保存模型权重
+model.save_pretrained(save_directory=output_dir)
+tokenizer.save_pretrained(save_directory=output_dir)
+"><span class="c1"># 保存模型权重</span>
+<span class="n">model</span><span class="o">.</span><span class="n">save_pretrained</span><span class="p">(</span><span class="n">save_directory</span><span class="o">=</span><span class="n">output_dir</span><span class="p">)</span>
+<span class="n">tokenizer</span><span class="o">.</span><span class="n">save_pretrained</span><span class="p">(</span><span class="n">save_directory</span><span class="o">=</span><span class="n">output_dir</span><span class="p">)</span>
+</code></pre></figure>
+<p>首先实现一个辅助函数，使用预训练 tokenizer 对提示和回答分词。两者必须分别分词，不添加特殊 token，然后直接按 <code>prompt_ids + response_ids</code> 拼接，中间不插入 EOS、BOS 或分隔 token。</p>
+<p>还需要构造 <code>response_mask</code>：它是与错位后的 labels 对齐的布尔掩码，仅当对应 label token 来自回答时为 <code>True</code>，提示和 padding 位置均为 <code>False</code>。训练时用它确保只在回答 token 上计算 loss。</p>
+<h3 class="problem-heading" id="tokenize_prompt_and_output">题目（tokenize_prompt_and_output）：提示与输出分词（1 分）</h3>
+<p><strong>交付内容：</strong> 实现 <code>tokenize_prompt_and_output</code>，分别对提示和输出分词，无特殊 token 地拼接，并构造 <code>response_mask</code>。推荐接口：</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="def tokenize_prompt_and_output(
+    prompt_strs: list[str],
+    output_strs: list[str],
+    tokenizer: PreTrainedTokenizer,
+) -&gt; dict[str, torch.Tensor]:
+"><span class="k">def</span><span class="w"> </span><span class="nf">tokenize_prompt_and_output</span><span class="p">(</span>
+    <span class="n">prompt_strs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+    <span class="n">output_strs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+    <span class="n">tokenizer</span><span class="p">:</span> <span class="n">PreTrainedTokenizer</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+</code></pre></figure>
+<p>功能：对提示和输出字符串分词，构造与 labels 对齐的掩码；回答 token 为 1，其他 token（提示或 padding）为 0。</p>
+<p>参数：</p>
+<ul>
+<li><code>prompt_strs: list[str]</code>：提示字符串列表。</li>
+<li><code>output_strs: list[str]</code>：输出字符串列表。</li>
+<li><code>tokenizer: PreTrainedTokenizer</code>：使用的 tokenizer。</li>
+</ul>
+<p>返回 <code>dict[str, torch.Tensor]</code>。设 <code>prompt_and_output_lens</code> 为各样本分词后拼接长度的列表，字典包含：</p>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>张量形状</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>input_ids</code></td>
+<td><code>(batch_size, max(prompt_and_output_lens) - 1)</code></td>
+<td>拼接后的提示和输出 token，去掉最后一个 token</td>
+</tr>
+<tr>
+<td><code>labels</code></td>
+<td>同上</td>
+<td>错位后的输入 ID，即去掉第一个 token</td>
+</tr>
+<tr>
+<td><code>response_mask</code></td>
+<td>同上</td>
+<td>与 labels 对齐，对应 label 属于回答时为 1，否则为 0</td>
+</tr>
+</tbody>
+</table>
+<p>实现 <code>adapters.run_tokenize_prompt_and_output</code>，然后运行并通过：</p>
+<figure class="code-block"><figcaption><span>bash</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="uv run pytest -k test_tokenize_prompt_and_output
+">uv<span class="w"> </span>run<span class="w"> </span>pytest<span class="w"> </span>-k<span class="w"> </span>test_tokenize_prompt_and_output
+</code></pre></figure>
+<p>得到分词后的输入后，可这样送入模型：</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="input_ids = train_batch[&quot;input_ids&quot;].to(device)
+labels = train_batch[&quot;labels&quot;].to(device)
+logits = model(input_ids).logits
+"><span class="n">input_ids</span> <span class="o">=</span> <span class="n">train_batch</span><span class="p">[</span><span class="s2">"input_ids"</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<span class="n">labels</span> <span class="o">=</span> <span class="n">train_batch</span><span class="p">[</span><span class="s2">"labels"</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<span class="n">logits</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span><span class="o">.</span><span class="n">logits</span>
+</code></pre></figure>
+<p>接下来实现计算回答逐 token 对数概率的函数，这是计算策略梯度所需的基本操作。RL 中记录逐 token 熵也很有用，因此还需要实现 <code>return_token_entropy</code> 选项。</p>
+<h3 class="problem-heading" id="get_response_log_probs">题目（get_response_log_probs）：回答的对数概率与熵（1 分）</h3>
+<p><strong>交付内容：</strong> 实现 <code>get_response_log_probs</code>，从因果语言模型获得各 token 在前序 token 条件下的对数概率，并可选返回模型下一 token 分布的熵。推荐接口：</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="def get_response_log_probs(
+    model: PreTrainedModel,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    return_token_entropy: bool = False,
+) -&gt; dict[str, torch.Tensor]:
+"><span class="k">def</span><span class="w"> </span><span class="nf">get_response_log_probs</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">:</span> <span class="n">PreTrainedModel</span><span class="p">,</span>
+    <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">labels</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">return_token_entropy</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+</code></pre></figure>
+<p>参数：</p>
+<ul>
+<li><code>model: PreTrainedModel</code>：用于评分的 Hugging Face 模型，应放到正确设备上；不需梯度时使用<a href="https://docs.pytorch.org/docs/stable/generated/torch.autograd.grad_mode.inference_mode.html#inference-mode">推理模式</a>。</li>
+<li><code>input_ids: torch.Tensor</code>：形状 <code>(batch_size, sequence_length)</code>，由分词函数产生的提示与回答拼接 token。</li>
+<li><code>labels: torch.Tensor</code>：同样形状，由分词函数产生的 labels。</li>
+<li><code>return_token_entropy: bool</code>：为 <code>True</code> 时同时返回逐 token 熵。</li>
+</ul>
+<p>返回字典：</p>
+<ul>
+<li><code>&quot;log_probs&quot;</code>：形状 <code>(batch_size, sequence_length)</code>，条件对数概率 <span class="math inline"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>log</mi><mo>⁡</mo><msub><mi>p</mi><mi>θ</mi></msub><mo stretchy="false">(</mo><msub><mi>x</mi><mi>t</mi></msub><mo>∣</mo><msub><mi>x</mi><mrow><mo>&lt;</mo><mi>t</mi></mrow></msub><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\log p_\theta(x_t\mid x_{&lt;t})</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span></span>。</li>
+<li><code>&quot;token_entropy&quot;</code>：可选，同样形状，每个位置的 token 熵，仅在 <code>return_token_entropy=True</code> 时出现。</li>
+</ul>
+<p>实现 <code>adapters.run_get_response_log_probs</code>，运行并通过：</p>
+<figure class="code-block"><figcaption><span>bash</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="uv run pytest -k test_get_response_log_probs
+">uv<span class="w"> </span>run<span class="w"> </span>pytest<span class="w"> </span>-k<span class="w"> </span>test_get_response_log_probs
+</code></pre></figure>
+<h3 id="section-5">4.2.2 在强化学习循环中使用 vLLM</h3>
+<p>RL 循环需要生成 rollout。我们的配置是：一张 GPU 放 Hugging Face 模型和优化器用于训练，另一张 GPU 放 vLLM，包括模型和 KV 缓存。因此，除前述初始化和生成接口外，每次推理前还需要在两张卡之间同步权重。以下接口位于 <code>cs336_alignment/vllm_utils.py</code>：</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="@dataclass
+class VLLMServer:
+    gpu: int = 1  # GPU 0 训练，GPU 1 推理
+
+    # 在训练 GPU 和 vLLM 之间创建 NCCL 权重传输组
+    def init_weight_sync(self, policy_device: str): ...
+
+    # 将当前 Hugging Face 策略权重复制到 vLLM，
+    # 并重置依赖旧权重的 vLLM 缓存
+    def sync_policy_weights(self, policy: torch.nn.Module) -&gt; None: ...
+
+    # 使用 vLLM 当前权重生成 rollout
+    def generate_completions(
+        self,
+        prompts: list[str],
+        sampling_params: dict,
+        batch_size: int | None = None,
+    ) -&gt; list[VLLMCompletion]: ...
+"><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">VLLMServer</span><span class="p">:</span>
+    <span class="n">gpu</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>  <span class="c1"># GPU 0 训练，GPU 1 推理</span>
+
+    <span class="c1"># 在训练 GPU 和 vLLM 之间创建 NCCL 权重传输组</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">init_weight_sync</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">policy_device</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span> <span class="o">...</span>
+
+    <span class="c1"># 将当前 Hugging Face 策略权重复制到 vLLM，</span>
+    <span class="c1"># 并重置依赖旧权重的 vLLM 缓存</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">sync_policy_weights</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">policy</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span> <span class="o">...</span>
+
+    <span class="c1"># 使用 vLLM 当前权重生成 rollout</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">generate_completions</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">prompts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+        <span class="n">sampling_params</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span>
+        <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">VLLMCompletion</span><span class="p">]:</span> <span class="o">...</span>
+</code></pre></figure>
+<p>与提示实验一样，使用温度 1.0、top-p 1.0、最大生成长度 512。提示要求以 <code>&lt;/answer&gt;</code> 结束，因此可以设置：</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="# 参考 Dr. GRPO：在模型完成答案时停止
+# https://github.com/sail-sg/understand-r1-zero/blob/
+#   c18804602b85da9e88b4aeeb6c43e2f08c594fbc/train_zero_math.py#L167
+sampling_params[&#x27;stop&#x27;] = [&quot;&lt;/answer&gt;&quot;]
+sampling_params[&#x27;include_stop_str_in_output&#x27;] = True
+"><span class="c1"># 参考 Dr. GRPO：在模型完成答案时停止</span>
+<span class="c1"># https://github.com/sail-sg/understand-r1-zero/blob/</span>
+<span class="c1">#   c18804602b85da9e88b4aeeb6c43e2f08c594fbc/train_zero_math.py#L167</span>
+<span class="n">sampling_params</span><span class="p">[</span><span class="s1">'stop'</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"&lt;/answer&gt;"</span><span class="p">]</span>
+<span class="n">sampling_params</span><span class="p">[</span><span class="s1">'include_stop_str_in_output'</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+</code></pre></figure>
+<h3 id="section-6">4.2.3 GRPO 组件</h3>
+<p>下面实现 GRPO loss 的组成部分。后面还会实现不同优势归一化器、不同重要性加权方式等变体。为使变体间切换时尽量少重复代码，接口包含选择变体的参数。本阶段只需要实现标准 GRPO。</p>
+<p>首先实现计算回答奖励的辅助函数。</p>
+<h3 class="problem-heading" id="compute_rollout_rewards">题目（compute_rollout_rewards）：计算 rollout 奖励（1 分）</h3>
+<p><strong>交付内容：</strong> 实现 <code>compute_rollout_rewards</code>，计算每个生成回答的原始奖励。</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="def compute_rollout_rewards(
+    reward_fn: Callable[[str, str], dict[str, float]],
+    rollout_responses: list[str],
+    repeated_ground_truths: list[str],
+) -&gt; tuple[torch.Tensor, dict[str, float]]:
+"><span class="k">def</span><span class="w"> </span><span class="nf">compute_rollout_rewards</span><span class="p">(</span>
+    <span class="n">reward_fn</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]],</span>
+    <span class="n">rollout_responses</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+    <span class="n">repeated_ground_truths</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]:</span>
+</code></pre></figure>
+<p>功能：为回答列表计算奖励，并返回奖励分量的元数据。</p>
+<p>参数：</p>
+<ul>
+<li><code>reward_fn</code>：对照标准答案给回答评分，返回包含 <code>&quot;reward&quot;</code>、<code>&quot;format_reward&quot;</code>、<code>&quot;answer_reward&quot;</code> 的字典。</li>
+<li><code>rollout_responses: list[str]</code>：策略生成的回答，长度为 <code>rollout_batch_size = n_prompts_per_rollout_batch * group_size</code>。</li>
+<li><code>repeated_ground_truths: list[str]</code>：每题标准答案重复 <code>group_size</code> 次后的列表，长度为 <code>rollout_batch_size</code>。</li>
+</ul>
+<p>返回 <code>(raw_rewards, metadata)</code>：</p>
+<ul>
+<li><code>raw_rewards</code>：形状 <code>(rollout_batch_size,)</code>，每个回答未经归一化的奖励。</li>
+<li><code>metadata</code>：用于日志的奖励统计，至少包含该批次总奖励和格式奖励的均值。</li>
+</ul>
+<p>实现 <code>adapters.run_compute_rollout_rewards</code>，运行并通过：</p>
+<figure class="code-block"><figcaption><span>bash</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="uv run pytest -k compute_rollout_rewards
+">uv<span class="w"> </span>run<span class="w"> </span>pytest<span class="w"> </span>-k<span class="w"> </span>compute_rollout_rewards
+</code></pre></figure>
+<p>下一步实现 GRPO 的核心数学操作，将奖励归一化为优势。上个函数输出的奖励是展平的，因此需要组大小将其恢复为分组形式。测试要求支持 <code>baseline=&quot;mean&quot;</code>、<code>advantage_normalizer=&quot;std&quot;</code>，并在组标准差上加 <code>advantage_eps</code>，避免除零。</p>
+<h3 class="problem-heading" id="compute_group_normalized_rewards_grpo">题目（compute_group_normalized_rewards_grpo）：组归一化（1 分）</h3>
+<p><strong>交付内容：</strong> 实现 <code>compute_group_normalized_rewards</code>，在组内归一化原始奖励，返回归一化结果和你认为有用的元数据。</p>
+<p>目前只需支持 <code>baseline=&quot;mean&quot;</code>、<code>advantage_normalizer=&quot;std&quot;</code>。对其他输入可以抛出 <code>NotImplementedError</code>，后面会实现其他选项并进行消融。记得给归一化分母加上 <code>advantage_eps</code>。</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="def compute_group_normalized_rewards(
+    raw_rewards: torch.Tensor,
+    group_size: int,
+    baseline: Literal[&quot;mean&quot;, &quot;none&quot;] = &quot;mean&quot;,
+    advantage_eps: float = 1e-6,
+    advantage_normalizer: Literal[&quot;std&quot;, &quot;none&quot;, &quot;mean&quot;] = &quot;std&quot;,
+):
+"><span class="k">def</span><span class="w"> </span><span class="nf">compute_group_normalized_rewards</span><span class="p">(</span>
+    <span class="n">raw_rewards</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">group_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">baseline</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"mean"</span><span class="p">,</span> <span class="s2">"none"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"mean"</span><span class="p">,</span>
+    <span class="n">advantage_eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-6</span><span class="p">,</span>
+    <span class="n">advantage_normalizer</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"std"</span><span class="p">,</span> <span class="s2">"none"</span><span class="p">,</span> <span class="s2">"mean"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"std"</span><span class="p">,</span>
+<span class="p">):</span>
+</code></pre></figure>
+<p>功能：在每个组内应用指定基线和归一化策略，计算优势。</p>
+<p>参数：</p>
+<ul>
+<li><code>raw_rewards</code>：形状 <code>(rollout_batch_size,)</code> 的原始奖励，其中 <code>rollout_batch_size = n_prompts_per_rollout_batch * group_size</code>。</li>
+<li><code>group_size: int</code>：每题／每组的回答数。</li>
+<li><code>baseline</code>：本题支持 <code>&quot;mean&quot;</code>，即减去组平均奖励；后面的 <code>&quot;none&quot;</code> 表示不减基线。</li>
+<li><code>advantage_eps: float</code>：防止归一化时除零的小常数。</li>
+<li><code>advantage_normalizer</code>：本题支持 <code>&quot;std&quot;</code>，即除以组标准差；后面的 <code>&quot;none&quot;</code> 表示不归一化，<code>&quot;mean&quot;</code> 表示除以组平均奖励。</li>
+</ul>
+<p>返回 <code>tuple[torch.Tensor, dict[str, float]]</code>：</p>
+<ul>
+<li><code>advantages</code>：形状 <code>(rollout_batch_size,)</code>，每个回答经过组归一化的奖励。</li>
+<li><code>metadata</code>：自选日志统计，如奖励均值、标准差、最大／最小值。</li>
+</ul>
+<p>实现 <code>adapters.run_compute_group_normalized_rewards</code>，运行并通过：</p>
+<figure class="code-block"><figcaption><span>bash</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="uv run pytest -k compute_group_normalized_rewards_grpo
+">uv<span class="w"> </span>run<span class="w"> </span>pytest<span class="w"> </span>-k<span class="w"> </span>compute_group_normalized_rewards_grpo
+</code></pre></figure>
+<p>接下来计算逐 token 策略梯度 loss。算法 1 写的是梯度估计器，本题要求写一个求导后产生 GRPO 各项梯度的逐 token loss，再在 token 间聚合。它并非传统意义上预期随训练不断下降的损失，只是求导后能得到策略梯度的表达式。</p>
+<p>应实现的目标为：</p>
+<div class="math block">
+<span class="katex-display"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mtable width="100%"><mtr><mtd width="50%"></mtd><mtd><mrow><msubsup><mi>J</mi><mi>θ</mi><mrow><mi mathvariant="normal">G</mi><mi mathvariant="normal">R</mi><mi mathvariant="normal">P</mi><mi mathvariant="normal">O</mi><mtext>-</mtext><mi mathvariant="normal">o</mi><mi mathvariant="normal">n</mi><mtext>-</mtext><mi mathvariant="normal">p</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">l</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">c</mi><mi mathvariant="normal">y</mi></mrow></msubsup><mo>=</mo><mfrac><mn>1</mn><mrow><mi>B</mi><mi>G</mi></mrow></mfrac><munderover><mo>∑</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi>B</mi></munderover><munderover><mo>∑</mo><mrow><mi>j</mi><mo>=</mo><mn>1</mn></mrow><mi>G</mi></munderover><mfrac><mn>1</mn><mrow><mi mathvariant="normal">len</mi><mo>⁡</mo><mo stretchy="false">(</mo><msup><mi>y</mi><mrow><mo stretchy="false">(</mo><mi>i</mi><mo separator="true">,</mo><mi>j</mi><mo stretchy="false">)</mo></mrow></msup><mo stretchy="false">)</mo></mrow></mfrac><munderover><mo>∑</mo><mrow><mi>t</mi><mo>=</mo><mn>1</mn></mrow><mrow><mi mathvariant="normal">len</mi><mo>⁡</mo><mo stretchy="false">(</mo><msup><mi>y</mi><mrow><mo stretchy="false">(</mo><mi>i</mi><mo separator="true">,</mo><mi>j</mi><mo stretchy="false">)</mo></mrow></msup><mo stretchy="false">)</mo></mrow></munderover><mfrac><mrow><mi>r</mi><mo stretchy="false">(</mo><msup><mi>y</mi><mrow><mo stretchy="false">(</mo><mi>i</mi><mo separator="true">,</mo><mi>j</mi><mo stretchy="false">)</mo></mrow></msup><mo>∣</mo><msup><mi>x</mi><mrow><mo stretchy="false">(</mo><mi>i</mi><mo stretchy="false">)</mo></mrow></msup><mo stretchy="false">)</mo><mo>−</mo><msub><mi>μ</mi><mi>i</mi></msub></mrow><msub><mrow><mi mathvariant="normal">s</mi><mi mathvariant="normal">t</mi><mi mathvariant="normal">d</mi></mrow><mi>i</mi></msub></mfrac><mi>log</mi><mo>⁡</mo><msub><mi>π</mi><mi>θ</mi></msub><mo stretchy="false">(</mo><msubsup><mi>y</mi><mi>t</mi><mrow><mo stretchy="false">(</mo><mi>i</mi><mo separator="true">,</mo><mi>j</mi><mo stretchy="false">)</mo></mrow></msubsup><mo>∣</mo><msup><mi>x</mi><mrow><mo stretchy="false">(</mo><mi>i</mi><mo stretchy="false">)</mo></mrow></msup><mo separator="true">,</mo><msubsup><mi>y</mi><mrow><mo>&lt;</mo><mi>t</mi></mrow><mrow><mo stretchy="false">(</mo><mi>i</mi><mo separator="true">,</mo><mi>j</mi><mo stretchy="false">)</mo></mrow></msubsup><mo stretchy="false">)</mo><mi mathvariant="normal">.</mi></mrow></mtd><mtd width="50%"></mtd><mtd><mtext>(32)</mtext></mtd></mtr></mtable><annotation encoding="application/x-tex">J_\theta^{\mathrm{GRPO\text{-}on\text{-}policy}}
+=\frac1{BG}\sum_{i=1}^B\sum_{j=1}^G\frac1{\operatorname{len}(y^{(i,j)})}
+\sum_{t=1}^{\operatorname{len}(y^{(i,j)})}
+\frac{r(y^{(i,j)}\mid x^{(i)})-\mu_i}{\mathrm{std}_i}
+\log\pi_\theta(y_t^{(i,j)}\mid x^{(i)},y_{&lt;t}^{(i,j)}). \tag{32}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2683em;vertical-align:-0.3013em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.09618em;">J</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.967em;"><span style="top:-2.3987em;margin-left:-0.0962em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">θ</span></span></span><span style="top:-3.1809em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathrm mtight">GRPO</span><span class="mord text mtight"><span class="mord mtight">-</span></span><span class="mord mathrm mtight">on</span><span class="mord text mtight"><span class="mord mtight">-</span></span><span class="mord mathrm mtight" style="margin-right:0.01389em;">policy</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3013em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.5265em;vertical-align:-1.4138em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">BG</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05017em;">B</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">G</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4138em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.296em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop"><span class="mord mathrm">len</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.814em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.954em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.1127em;"><span style="top:-1.8829em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.386em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mord mathrm mtight">len</span></span><span class="mopen mtight">(</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9667em;"><span style="top:-2.9667em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5357em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2671em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.565em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord"><span class="mord mathrm">std</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.888em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.888em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">i</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">π</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.4542em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2458em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.3179em;vertical-align:-0.2731em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.938em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">i</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.4542em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">t</span></span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight">i</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2731em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">.</span></span><span class="tag"><span class="strut" style="height:3.5265em;vertical-align:-1.4138em;"></span><span class="mord text"><span class="mord">(</span><span class="mord"><span class="mord">32</span></span><span class="mord">)</span></span></span></span></span></span>
+</div>
+<p>可以检查它的梯度就是算法 1 中的梯度。PyTorch 优化器执行梯度下降，所以实现应返回这个目标的负值。<code>compute_policy_gradient_loss</code> 计算每个序列、每个 token 的 loss，随后由聚合函数在 token 和序列维度取平均。</p>
+<h3 class="problem-heading" id="compute_policy_gradient_loss_on_policy">题目（compute_policy_gradient_loss_on_policy）：同策略策略梯度（1 分）</h3>
+<p><strong>交付内容：</strong> 实现 <code>compute_policy_gradient_loss</code>，给定原始奖励或预先计算的优势，计算逐 token 策略梯度 loss。</p>
+<p>目前假定所有 rollout 都是同策略的，只需支持 <code>importance_reweighting_method=&quot;none&quot;</code>，可忽略旧对数概率和裁剪参数。其他输入可抛出 <code>NotImplementedError</code>，裁剪将在后面实现。</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="def compute_policy_gradient_loss(
+    raw_rewards_or_advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    importance_reweighting_method: Literal[&quot;none&quot;, &quot;noclip&quot;, &quot;grpo&quot;, &quot;gspo&quot;] = &quot;none&quot;,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+    response_mask: torch.Tensor | None = None,
+) -&gt; tuple[torch.Tensor, dict[str, torch.Tensor]]:
+"><span class="k">def</span><span class="w"> </span><span class="nf">compute_policy_gradient_loss</span><span class="p">(</span>
+    <span class="n">raw_rewards_or_advantages</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">policy_log_probs</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">importance_reweighting_method</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"none"</span><span class="p">,</span> <span class="s2">"noclip"</span><span class="p">,</span> <span class="s2">"grpo"</span><span class="p">,</span> <span class="s2">"gspo"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"none"</span><span class="p">,</span>
+    <span class="n">old_log_probs</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">cliprange</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">response_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]:</span>
+</code></pre></figure>
+<p>参数：</p>
+<ul>
+<li><code>raw_rewards_or_advantages</code>：形状 <code>(batch_size,)</code> 或 <code>(batch_size, 1)</code>，每个回答的标量奖励或已归一化优势。</li>
+<li><code>policy_log_probs</code>：形状 <code>(batch_size, sequence_length)</code>，每个 token 的对数概率。</li>
+<li><code>importance_reweighting_method</code>：<code>&quot;none&quot;</code> 不使用重要性加权；<code>&quot;noclip&quot;</code> 加权但不裁剪；<code>&quot;grpo&quot;</code> 使用 PPO/GRPO 风格的 token 级加权与裁剪；<code>&quot;gspo&quot;</code> 使用 GSPO 风格的序列级加权与裁剪。</li>
+<li><code>old_log_probs</code>：形状 <code>(batch_size, sequence_length)</code>；除 <code>&quot;none&quot;</code> 外均需要。</li>
+<li><code>cliprange</code>：裁剪参数 <span class="math inline"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ε</mi></mrow><annotation encoding="application/x-tex">\varepsilon</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ε</span></span></span></span></span>，<code>&quot;grpo&quot;</code> 和 <code>&quot;gspo&quot;</code> 需要。</li>
+<li><code>response_mask</code>：可选，形状 <code>(batch_size, sequence_length)</code> 的回答 token 掩码。GSPO 若仅在回答 token 上平均序列对数比值，则需要它。</li>
+</ul>
+<p>返回 <code>(per_token_policy_gradient_loss, metadata)</code>：</p>
+<ul>
+<li>loss 形状为 <code>(batch_size, sequence_length)</code>，训练循环中将沿批次和序列维度聚合。</li>
+<li><code>metadata</code> 为底层 loss 计算的统计量，例如裁剪比例的组成项。</li>
+</ul>
+<p>实现 <code>adapters.run_compute_policy_gradient_loss</code>，运行并通过：</p>
+<figure class="code-block"><figcaption><span>bash</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="uv run pytest -k test_compute_policy_gradient_loss_on_policy
+">uv<span class="w"> </span>run<span class="w"> </span>pytest<span class="w"> </span>-k<span class="w"> </span>test_compute_policy_gradient_loss_on_policy
+</code></pre></figure>
+<p>最后实现跨 token 和序列的聚合。标准 GRPO 先在每个序列内平均，再对序列平均。后面会实现除以常数的替代方案，它更忠实于最初希望估计的策略梯度。</p>
+<h3 class="problem-heading" id="aggregate_loss_across_microbatch_sequence">题目（aggregate_loss_across_microbatch_sequence）：跨 token 和序列聚合 loss（0.5 分）</h3>
+<p><strong>交付内容：</strong> 实现 <code>aggregate_loss_across_microbatch</code>，输入逐 token loss 和回答掩码，输出平均 loss。本阶段使用标准 GRPO 聚合，先在每个序列内平均，再对序列平均，即可假定 <code>loss_normalization=&quot;sequence&quot;</code>。其他输入可抛出 <code>NotImplementedError</code>。</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="def aggregate_loss_across_microbatch(
+    per_token_policy_gradient_loss: torch.Tensor,
+    mask: torch.Tensor,
+    loss_normalization: Literal[&quot;sequence&quot;, &quot;constant&quot;] = &quot;sequence&quot;,
+    normalization_constant: int | None = None,
+) -&gt; torch.Tensor:
+"><span class="k">def</span><span class="w"> </span><span class="nf">aggregate_loss_across_microbatch</span><span class="p">(</span>
+    <span class="n">per_token_policy_gradient_loss</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">loss_normalization</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"sequence"</span><span class="p">,</span> <span class="s2">"constant"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"sequence"</span><span class="p">,</span>
+    <span class="n">normalization_constant</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+</code></pre></figure>
+<p>功能：根据回答掩码和 loss 归一化策略聚合逐 token 策略梯度 loss。</p>
+<p>参数：</p>
+<ul>
+<li><code>per_token_policy_gradient_loss</code>：形状 <code>(batch_size, sequence_length)</code>。</li>
+<li><code>mask</code>：同样形状，标记哪些位置应计入 loss。</li>
+<li><code>loss_normalization</code>：<code>&quot;sequence&quot;</code> 先序列内平均、再跨序列平均；<code>&quot;constant&quot;</code> 将总 loss 除以常数。</li>
+<li><code>normalization_constant</code>：总 loss 的除数，<code>loss_normalization=&quot;constant&quot;</code> 时必须提供。</li>
+</ul>
+<p>返回 <code>loss: torch.Tensor</code>，包含平均 loss 的标量，必须保留后续调用 <code>backward</code> 的能力。</p>
+<p>实现 <code>adapters.run_aggregate_loss_across_microbatch</code>，运行并通过：</p>
+<figure class="code-block"><figcaption><span>bash</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="uv run pytest -k test_aggregate_loss_across_microbatch_sequence
+">uv<span class="w"> </span>run<span class="w"> </span>pytest<span class="w"> </span>-k<span class="w"> </span>test_aggregate_loss_across_microbatch_sequence
+</code></pre></figure>
+<h3 id="section-11">4.2.4 GRPO 训练步骤</h3>
+<p>现在把这些组件组合成完整训练步骤。</p>
+<p><strong>梯度累积。</strong> 为充分利用推理资源，需要较大的批次。同策略 RL 中训练批次大小等于推理批次大小，因此 GPU 显存无法一次容纳整个批次的梯度计算。我们需要拆成多个微批次，累积梯度。关键是正确处理归一化，确保累积结果等价于整个批次一次计算的梯度。</p>
+<p>PyTorch 中梯度累积很直接。每个权重张量的 <code>.grad</code> 属性保存梯度；第一次调用 <code>loss.backward()</code> 前通常为 <code>None</code>，调用后包含梯度。通常先做优化器更新，再调用 <code>optimizer.zero_grad()</code> 重置权重张量的 <code>.grad</code>：</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="# 前向传播
+logits = model(inputs)
+loss = loss_fn(logits, labels)
+# 反向传播
+loss.backward()
+# 更新权重
+optimizer.step()
+# 清空梯度，为下一轮准备
+optimizer.zero_grad()
+"><span class="c1"># 前向传播</span>
+<span class="n">logits</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">loss_fn</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">labels</span><span class="p">)</span>
+<span class="c1"># 反向传播</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="c1"># 更新权重</span>
+<span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="c1"># 清空梯度，为下一轮准备</span>
+<span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+</code></pre></figure>
+<p>梯度累积把批次分成 <span class="math inline"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>k</mi></mrow><annotation encoding="application/x-tex">k</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span></span> 个微批次，只调用一次 <code>optimizer.step()</code> 和一次 <code>optimizer.zero_grad()</code>。若使用先序列内平均、再跨序列平均的归一化，计算出微批次平均 loss 后，还要按序列数量重新加权：</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="gradient_accumulation_steps = 4
+microbatch_size = len(inputs) // gradient_accumulation_steps
+for i in range(0, len(inputs), microbatch_size):
+    inputs_microbatch = inputs[i:i+microbatch_size]
+    labels_microbatch = labels[i:i+microbatch_size]
+    # 前向传播
+    logits = model(inputs_microbatch)
+    loss = loss_fn(logits, labels_microbatch) * (len(inputs_microbatch) / len(inputs))
+    # 反向传播
+    loss.backward()
+# 整个批次只更新一次权重
+optimizer.step()
+# 整个批次只清空一次梯度
+optimizer.zero_grad()
+"><span class="n">gradient_accumulation_steps</span> <span class="o">=</span> <span class="mi">4</span>
+<span class="n">microbatch_size</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span> <span class="o">//</span> <span class="n">gradient_accumulation_steps</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">inputs</span><span class="p">),</span> <span class="n">microbatch_size</span><span class="p">):</span>
+    <span class="n">inputs_microbatch</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="n">i</span><span class="p">:</span><span class="n">i</span><span class="o">+</span><span class="n">microbatch_size</span><span class="p">]</span>
+    <span class="n">labels_microbatch</span> <span class="o">=</span> <span class="n">labels</span><span class="p">[</span><span class="n">i</span><span class="p">:</span><span class="n">i</span><span class="o">+</span><span class="n">microbatch_size</span><span class="p">]</span>
+    <span class="c1"># 前向传播</span>
+    <span class="n">logits</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">inputs_microbatch</span><span class="p">)</span>
+    <span class="n">loss</span> <span class="o">=</span> <span class="n">loss_fn</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">labels_microbatch</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">inputs_microbatch</span><span class="p">)</span> <span class="o">/</span> <span class="nb">len</span><span class="p">(</span><span class="n">inputs</span><span class="p">))</span>
+    <span class="c1"># 反向传播</span>
+    <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+<span class="c1"># 整个批次只更新一次权重</span>
+<span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+<span class="c1"># 整个批次只清空一次梯度</span>
+<span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+</code></pre></figure>
+<p>后面改用常数归一化时，微批次代码也要相应调整。</p>
+<p><strong>实现训练步骤。</strong> 给定一批 rollout，函数接收模型、tokenizer、优化器、奖励函数、提示、回答和超参数，累积梯度并执行一次优化器更新。为避免显存不足，必须实现前述梯度累积。在更新前，还应将梯度范数裁剪到 <code>max_grad_norm</code>。返回批次训练 loss 和元数据以供日志记录。至少记录：</p>
+<ul>
+<li>loss。</li>
+<li>梯度范数。</li>
+<li>token 熵。</li>
+<li>训练奖励，包括总奖励和格式奖励。</li>
+</ul>
+<p>也欢迎记录其他指标，例如 <span class="math inline"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>k</mi></mrow><annotation encoding="application/x-tex">k</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span></span> 从 1 到 <code>group_size</code> 的 pass@k，即前 <span class="math inline"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>k</mi></mrow><annotation encoding="application/x-tex">k</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span></span> 个 rollout 中至少有一个正确回答的问题比例。</p>
+<h3 class="problem-heading" id="grpo_train_step_standard_on_policy">题目（grpo_train_step_standard_on_policy）：GRPO 训练步骤（5 分）</h3>
+<p><strong>交付内容：</strong> 给定模型、tokenizer 和 rollout，实现一次批次策略梯度更新。本阶段只要求标准同策略 GRPO：<code>baseline=&quot;mean&quot;</code>、<code>advantage_normalizer=&quot;std&quot;</code>、<code>importance_reweighting_method=&quot;none&quot;</code>、<code>loss_normalization=&quot;sequence&quot;</code>。其他输入可抛出 <code>NotImplementedError</code>。</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="def grpo_train_step(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    optimizer: Optimizer,
+    gradient_accumulation_steps: int,
+    max_grad_norm: float | None,
+    reward_fn: Callable[[str, str], dict[str, float]],
+    repeated_prompts: list[str],
+    rollout_responses: list[str],
+    repeated_ground_truths: list[str],
+    group_size: int,
+    # 奖励归一化
+    baseline: Literal[&quot;mean&quot;, &quot;none&quot;] = &quot;mean&quot;,
+    advantage_eps: float = 1e-6,
+    advantage_normalizer: Literal[&quot;std&quot;, &quot;none&quot;, &quot;mean&quot;] = &quot;std&quot;,
+    # 重要性加权与裁剪
+    importance_reweighting_method: Literal[&quot;none&quot;, &quot;noclip&quot;, &quot;grpo&quot;, &quot;gspo&quot;] = &quot;none&quot;,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+    # loss 归一化
+    loss_normalization: Literal[&quot;sequence&quot;, &quot;constant&quot;] = &quot;sequence&quot;,
+    normalization_constant: int | None = None,
+) -&gt; tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
+"><span class="k">def</span><span class="w"> </span><span class="nf">grpo_train_step</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">:</span> <span class="n">PreTrainedModel</span><span class="p">,</span>
+    <span class="n">tokenizer</span><span class="p">:</span> <span class="n">PreTrainedTokenizer</span><span class="p">,</span>
+    <span class="n">optimizer</span><span class="p">:</span> <span class="n">Optimizer</span><span class="p">,</span>
+    <span class="n">gradient_accumulation_steps</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">max_grad_norm</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">reward_fn</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]],</span>
+    <span class="n">repeated_prompts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+    <span class="n">rollout_responses</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+    <span class="n">repeated_ground_truths</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+    <span class="n">group_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="c1"># 奖励归一化</span>
+    <span class="n">baseline</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"mean"</span><span class="p">,</span> <span class="s2">"none"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"mean"</span><span class="p">,</span>
+    <span class="n">advantage_eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-6</span><span class="p">,</span>
+    <span class="n">advantage_normalizer</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"std"</span><span class="p">,</span> <span class="s2">"none"</span><span class="p">,</span> <span class="s2">"mean"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"std"</span><span class="p">,</span>
+    <span class="c1"># 重要性加权与裁剪</span>
+    <span class="n">importance_reweighting_method</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"none"</span><span class="p">,</span> <span class="s2">"noclip"</span><span class="p">,</span> <span class="s2">"grpo"</span><span class="p">,</span> <span class="s2">"gspo"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"none"</span><span class="p">,</span>
+    <span class="n">old_log_probs</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">cliprange</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="c1"># loss 归一化</span>
+    <span class="n">loss_normalization</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"sequence"</span><span class="p">,</span> <span class="s2">"constant"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"sequence"</span><span class="p">,</span>
+    <span class="n">normalization_constant</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="nb">float</span><span class="p">]]:</span>
+</code></pre></figure>
+<p>功能：通过 <code>gradient_accumulation_steps</code> 个微批次执行前向和反向传播。</p>
+<p>参数：</p>
+<ul>
+<li><code>model: PreTrainedModel</code>：待训练的 Hugging Face 模型。</li>
+<li><code>tokenizer: PreTrainedTokenizer</code>：分词器。</li>
+<li><code>optimizer: Optimizer</code>：模型优化器。</li>
+<li><code>gradient_accumulation_steps: int</code>：一次优化器更新包含的微批次数。</li>
+<li><code>max_grad_norm: float | None</code>：若非 <code>None</code>，在 <code>optimizer.step()</code> 前将梯度范数裁剪到此值。</li>
+<li><code>reward_fn</code>：对照标准答案给 rollout 评分，返回 <code>&quot;reward&quot;</code>、<code>&quot;format_reward&quot;</code>、<code>&quot;answer_reward&quot;</code>。</li>
+<li><code>repeated_prompts: list[str]</code>：每题提示重复 <code>group_size</code> 次，列表长度为 <code>rollout_batch_size</code>。</li>
+<li><code>rollout_responses: list[str]</code>：策略回答，长度为 <code>rollout_batch_size = n_prompts_per_rollout_batch * group_size</code>。</li>
+<li><code>repeated_ground_truths: list[str]</code>：每题标准答案重复 <code>group_size</code> 次，列表长度为 <code>rollout_batch_size</code>。</li>
+<li><code>group_size: int</code>：每题／每组的回答数。</li>
+<li><code>baseline</code>：<code>&quot;mean&quot;</code> 减去组平均奖励；<code>&quot;none&quot;</code> 不做处理。</li>
+<li><code>advantage_eps: float</code>：避免归一化除零的小常数。</li>
+<li><code>advantage_normalizer</code>：<code>&quot;std&quot;</code> 除以组标准差；<code>&quot;none&quot;</code> 不归一化；<code>&quot;mean&quot;</code> 除以组平均奖励。</li>
+<li><code>importance_reweighting_method</code>：<code>&quot;none&quot;</code> 不加权；<code>&quot;noclip&quot;</code> 重要性加权但不裁剪；<code>&quot;grpo&quot;</code> 使用 PPO/GRPO token 级加权与裁剪；<code>&quot;gspo&quot;</code> 使用 GSPO 序列级加权与裁剪。</li>
+<li><code>old_log_probs</code>：形状 <code>(batch_size, sequence_length)</code>，除 <code>&quot;none&quot;</code> 外均需要。</li>
+<li><code>cliprange</code>：裁剪参数 <span class="math inline"><span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ε</mi></mrow><annotation encoding="application/x-tex">\varepsilon</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ε</span></span></span></span></span>，<code>&quot;grpo&quot;</code> 或 <code>&quot;gspo&quot;</code> 时需要。</li>
+<li><code>loss_normalization</code>：<code>&quot;sequence&quot;</code> 先在每个序列内平均再跨序列平均；<code>&quot;constant&quot;</code> 将总 loss 除以整个训练期间固定的常数。</li>
+<li><code>normalization_constant</code>：总 loss 的除数，常数归一化时必须提供。</li>
+</ul>
+<p>返回值：</p>
+<ul>
+<li><code>loss</code>：标量张量，经过梯度累积调整的批次 loss，供日志使用。</li>
+<li><code>metadata</code>：包含底层 loss 计算的元数据、裁剪前梯度范数和其他希望记录的统计量。</li>
+</ul>
+<p>实现 <code>adapters.run_grpo_train_step</code>，运行并通过：</p>
+<figure class="code-block"><figcaption><span>bash</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="uv run pytest -k test_grpo_train_step_standard_on_policy
+">uv<span class="w"> </span>run<span class="w"> </span>pytest<span class="w"> </span>-k<span class="w"> </span>test_grpo_train_step_standard_on_policy
+</code></pre></figure>
+</article><nav class="reading-links" aria-label="前后模块"><a href="assignment5-grpo-theory.html">← 同策略 GRPO 推导</a><a href="assignment5-requirements.html#tokenize_prompt_and_output">返回任务总览</a><a href="assignment5-grpo-experiments.html">标准 GRPO 实验 →</a></nav><footer class="reader-footer">总览用于查看任务和进度；本页用于阅读原文章节。后续问题直接更新对应页面。</footer></main></div></body></html>

@@ -1,0 +1,111 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>提示与评估基线 · 作业 5 详细说明</title><link rel="stylesheet" href="assets/katex/katex.min.css"><link rel="stylesheet" href="assets/assignment5-reader.css"><script src="assets/assignment5-reader.js" defer></script></head><body><div class="reader-layout"><aside class="reader-sidebar"><div class="brand">CS336 / ASSIGNMENT 5</div><a class="back-link" data-back-link href="assignment5-requirements.html#prompting_baselines">← 返回任务总览</a><div class="nav-caption">完整模块</div><nav aria-label="模块切换"><a class="module-link" href="assignment5-background.html">背景与符号<small>第 1–2 节</small></a><a class="module-link" href="assignment5-prompting.html" aria-current="page">提示与评估基线<small>第 3 节</small></a><a class="module-link" href="assignment5-grpo-theory.html">同策略 GRPO 推导<small>第 4.1 节</small></a><a class="module-link" href="assignment5-grpo-implementation.html">实现同策略 GRPO<small>第 4.2 节</small></a><a class="module-link" href="assignment5-grpo-experiments.html">标准 GRPO 实验<small>第 4.3 节</small></a><a class="module-link" href="assignment5-on-policy-variants.html">同策略算法变体<small>第 5 节</small></a><a class="module-link" href="assignment5-off-policy.html">异策略强化学习<small>第 6 节</small></a><a class="module-link" href="assignment5-custom-estimator.html">自己的估计器与参考文献<small>第 7 节 / 参考文献</small></a><a class="module-link" href="assignment5-safety-supplement.html">安全对齐与 RLHF（可选）<small>完全可选补充</small></a></nav><details open><summary>本页目录 · 点击题目定位</summary><nav aria-label="本页目录"><a class="toc-link" href="#section-1">3 提示</a><a class="toc-link" href="#section-2">3.1 使用 vLLM 进行推理</a><a class="toc-link" href="#section-3">3.2 零样本、少样本和思维链提示</a><a class="toc-link" href="#section-4">3.3 评分函数</a><a class="toc-link" href="#section-5">3.4 实验</a><a class="toc-link task-entry" href="#prompting_baselines">题目（prompting_baselines）：在 GSM8K 上运行 OLMo-2-0425-1B（5 分）</a></nav></details></aside><main class="reader-main"><header class="reader-header"><div class="eyebrow">第 3 节 / 完整中文说明</div><h1>提示与评估基线</h1><p>来源：<code>translations/assignment5_alignment_zh.md</code>。保留原文要求、推导、示例代码与参数说明。</p><a class="jump-context" href="#module-start">↑ 从本模块开头阅读上下文</a></header><article class="prose" id="module-start"><h2 id="section-1">3 提示</h2>
+<p>将预训练基础模型用于下游任务的第一步是给它提示。基础模型通过预训练学到了广泛的行为，提示是一种轻量方法，可以让其行为更偏向解决任务。后文还会看到，提示选择会影响 RL 动态和探索。</p>
+<p>最基本的方法是给出问题，再从模型的下一 token 分布中采样答案；我们称其为 <code>question_only</code>。我们会将它与 <code>r1_zero</code> 比较：后者除了问题，还包含要求模型进行思维链推理的指令 [DeepSeek-AI 等，2025]。</p>
+<h3 id="section-2">3.1 使用 vLLM 进行推理</h3>
+<p>生成模型回答需要推理引擎。实现推理引擎不在本作业范围内，因此我们使用 vLLM [W. Kwon 等，2023]。它实现了快速 CUDA 内核、用于高效管理注意力 KV 缓存的 PagedAttention 等优化。<code>cs336_alignment/vllm_utils.py</code> 已提供启动服务器和生成文本的代码，接口如下：</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="@dataclass
+class VLLMCompletion:
+    text: str
+    token_ids: list[int]
+    finish_reason: str | None
+
+@dataclass
+class VLLMServer:
+    model_id: str
+    gpu: int = 0
+    seed: int = 0
+    gpu_memory_utilization: float = 0.9
+
+    def start(self) -&gt; None: ...
+
+    def generate_completions(
+        self,
+        prompts: list[str],
+        sampling_params: dict,
+        batch_size: int | None = None,
+    ) -&gt; list[VLLMCompletion]: ...
+"><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">VLLMCompletion</span><span class="p">:</span>
+    <span class="n">text</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">token_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="n">finish_reason</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span>
+
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">VLLMServer</span><span class="p">:</span>
+    <span class="n">model_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">gpu</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">seed</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">gpu_memory_utilization</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.9</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">start</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span> <span class="o">...</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">generate_completions</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">prompts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+        <span class="n">sampling_params</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span>
+        <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">VLLMCompletion</span><span class="p">]:</span> <span class="o">...</span>
+</code></pre></figure>
+<h3 id="section-3">3.2 零样本、少样本和思维链提示</h3>
+<p>除非另有说明，GSM8K 实验使用以下来自 DeepSeek R1-Zero [DeepSeek-AI 等，2025] 的提示，称为 <code>r1_zero</code>：</p>
+<figure class="code-block"><figcaption><span>text</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within &lt;think&gt; &lt;/think&gt; and the answer is enclosed within &lt;answer&gt; &lt;/answer&gt; tags, respectively, i.e., &lt;think&gt; reasoning process here &lt;/think&gt; &lt;answer&gt; answer here &lt;/answer&gt;.
+User: {question}
+Assistant: &lt;think&gt;
+">A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within &lt;think&gt; &lt;/think&gt; and the answer is enclosed within &lt;answer&gt; &lt;/answer&gt; tags, respectively, i.e., &lt;think&gt; reasoning process here &lt;/think&gt; &lt;answer&gt; answer here &lt;/answer&gt;.
+User: {question}
+Assistant: &lt;think&gt;
+</code></pre></figure>
+<p>提示含义：用户提出问题，助手先思考推理过程，再给出答案；推理放在 <code>&lt;think&gt;...&lt;/think&gt;</code> 中，答案放在 <code>&lt;answer&gt;...&lt;/answer&gt;</code> 中。</p>
+<p>该提示位于 <code>cs336_alignment/prompts/r1_zero.prompt</code>。其中 <code>question</code> 是插入的问题，例如前述 Natalia 卖发夹的题目。模型应扮演助手，从思考过程开始生成，因为开头的 <code>&lt;think&gt;</code> 已经包含在提示中；随后以 <code>&lt;/think&gt;</code> 结束思考，再在答案标签内生成最终的符号答案，例如 <code>&lt;answer&gt; 4x + 10 &lt;/answer&gt;</code>。这些标签便于解析输出并与标准答案比较，也使我们可以在遇到 <code>&lt;/answer&gt;</code> 时停止生成。</p>
+<p>另一种方法称为少样本提示：在真正的问题之前放几个问答示例。<code>r1_zero</code> 的少样本形式如下：</p>
+<figure class="code-block"><figcaption><span>text</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within &lt;think&gt; &lt;/think&gt; and the answer is enclosed within &lt;answer&gt; &lt;/answer&gt; tags, respectively, i.e., &lt;think&gt; reasoning process here &lt;/think&gt; &lt;answer&gt; answer here &lt;/answer&gt;.
+User: {question-1}
+Assistant: &lt;think&gt; {reasoning-1} &lt;/think&gt; &lt;answer&gt; {answer-1} &lt;/answer&gt;
+User: {question-2}
+Assistant: &lt;think&gt; {reasoning-2} &lt;/think&gt; &lt;answer&gt; {answer-2} &lt;/answer&gt;
+User: {question-3}
+Assistant: &lt;think&gt; {reasoning-3} &lt;/think&gt; &lt;answer&gt; {answer-3} &lt;/answer&gt;
+User: {question}
+Assistant: &lt;think&gt;
+">A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within &lt;think&gt; &lt;/think&gt; and the answer is enclosed within &lt;answer&gt; &lt;/answer&gt; tags, respectively, i.e., &lt;think&gt; reasoning process here &lt;/think&gt; &lt;answer&gt; answer here &lt;/answer&gt;.
+User: {question-1}
+Assistant: &lt;think&gt; {reasoning-1} &lt;/think&gt; &lt;answer&gt; {answer-1} &lt;/answer&gt;
+User: {question-2}
+Assistant: &lt;think&gt; {reasoning-2} &lt;/think&gt; &lt;answer&gt; {answer-2} &lt;/answer&gt;
+User: {question-3}
+Assistant: &lt;think&gt; {reasoning-3} &lt;/think&gt; &lt;answer&gt; {answer-3} &lt;/answer&gt;
+User: {question}
+Assistant: &lt;think&gt;
+</code></pre></figure>
+<p>少样本提示通过展示待解决任务的几个示例来改善模型表现。开放基础模型报告的基准成绩通常采用少样本设置，例如 OLMo-2-0425-1B 模型卡上的 GSM8K 结果采用 8-shot 提示。我们在 <code>cs336_alignment/prompts/r1_zero_three_shot_gsm8k.prompt</code> 中提供了 3-shot 版本，示例来自 <a href="https://github.com/allenai/olmes/blob/main/oe_eval/tasks/fewshot_sources.py#L2247">OLMES 仓库</a>。</p>
+<p>最后，作为基线，我们还使用 <code>cs336_alignment/prompts/question_only.prompt</code> 中的提示：</p>
+<figure class="code-block"><figcaption><span>text</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="{question} Please put your final answer within \\boxed{{}}.
+">{question} Please put your final answer within \\boxed{{}}.
+</code></pre></figure>
+<p>虽然称为 <code>question_only</code>，它仍要求将最终答案放进方框，以便评分器从回答中解析答案，下一节会进一步说明。</p>
+<h3 id="section-4">3.3 评分函数</h3>
+<p>模型生成回答后，我们需要检查其正确性。数学题带有标准答案，例如 0.5，但模型可以用多种形式表达同一个正确答案，如 <code>&lt;answer&gt; 1/2 &lt;/answer&gt;</code> 或 <code>The answer is 0.5.</code>。因此，我们需要一个以模型输出和已知标准答案为输入、返回正确与否的布尔值的答案解析函数。</p>
+<p>实验使用近期推理 RL 研究中的一个快速且较准确的解析器 [Z. Liu 等，2025]。对于 <code>r1_zero</code> 提示，奖励函数为 <code>cs336_alignment.drgrpo_grader.r1_zero_reward_fn</code>。<code>question_only</code> 不要求 <code>&lt;think&gt;</code> 和 <code>&lt;answer&gt;</code> 标签，应使用同文件中的 <code>cs336_alignment.drgrpo_grader.question_only_reward_fn</code>；它会在 <code>\boxed{}</code> 中寻找最终答案。</p>
+<p>这些函数返回总奖励，以及独立的格式奖励和答案奖励，分别表示是否符合预期格式、解析出的答案是否正确。有些研究对格式正确但答案错误的回答也给部分分数，即非零总奖励。本实验不给部分分：总奖励就是答案奖励，格式奖励仅用于日志记录。</p>
+<p>注意，<code>ground_truth</code> 参数应只包含最终答案。GSM8K 的答案字段格式为 <code>{rationale} #### {answer}</code>，因此应按 <code>####</code> 分割，并去掉答案两端空白。</p>
+<h3 id="section-5">3.4 实验</h3>
+<p>现在可以评估基础模型在不同提示下的表现。</p>
+<p><strong>生成超参数。</strong> 采样温度为 1.0，top-p 为 1.0，最大生成长度为 512。<code>r1_zero</code> 要求模型以 <code>&lt;/answer&gt;</code> 结束，因此可以指示 vLLM 在输出该字符串时停止：</p>
+<figure class="code-block"><figcaption><span>python</span><button type="button" class="copy-code">复制代码</button></figcaption><pre class="highlight"><code data-source="# 参考 Dr. GRPO：在模型完成答案时停止
+# https://github.com/sail-sg/understand-r1-zero/blob/
+#   c18804602b85da9e88b4aeeb6c43e2f08c594fbc/train_zero_math.py#L167
+sampling_params[&#x27;stop&#x27;] = [&quot;&lt;/answer&gt;&quot;]
+sampling_params[&#x27;include_stop_str_in_output&#x27;] = True
+"><span class="c1"># 参考 Dr. GRPO：在模型完成答案时停止</span>
+<span class="c1"># https://github.com/sail-sg/understand-r1-zero/blob/</span>
+<span class="c1">#   c18804602b85da9e88b4aeeb6c43e2f08c594fbc/train_zero_math.py#L167</span>
+<span class="n">sampling_params</span><span class="p">[</span><span class="s1">'stop'</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"&lt;/answer&gt;"</span><span class="p">]</span>
+<span class="n">sampling_params</span><span class="p">[</span><span class="s1">'include_stop_str_in_output'</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+</code></pre></figure>
+<p>这个停止字符串仅用于 <code>r1_zero</code> 和 <code>r1_zero_three_shot</code>，不要用于 <code>question_only</code>。</p>
+<h4 class="problem-heading" id="prompting_baselines">题目（prompting_baselines）：在 GSM8K 上运行 OLMo-2-0425-1B（5 分）</h4>
+<p><strong>（a）</strong> 编写脚本，评估零样本 <code>question_only</code>、零样本 <code>r1_zero</code> 和少样本 <code>r1_zero_three_shot</code> 下的模型表现。运行脚本并观察输出。对每种提示，统计生成结果属于以下三类的数量：（1）格式和正确性奖励均为 1；（2）格式奖励为 1、正确性奖励为 0；（3）两项奖励均为 0。至少观察第 2 类的十个例子：其中多少其实回答正确，只是未被正确解析？第 3 类又如何？</p>
+<p><strong>交付内容：</strong> 几句话的分析、评估指标，以及若干提示和回答示例。</p>
+<p><strong>（b）</strong> 根据输出描述每种提示下的模型行为。例如，若希望模型回答问题，仅提供问题是否足够？模型是否还有回答之外的其他行为？零样本 <code>r1_zero</code> 和少样本 <code>r1_zero_three_shot</code> 如何塑造模型行为？</p>
+<p><strong>交付内容：</strong> 几句话的分析，并用示例支持。</p>
+</article><nav class="reading-links" aria-label="前后模块"><a href="assignment5-background.html">← 背景与符号</a><a href="assignment5-requirements.html#prompting_baselines">返回任务总览</a><a href="assignment5-grpo-theory.html">同策略 GRPO 推导 →</a></nav><footer class="reader-footer">总览用于查看任务和进度；本页用于阅读原文章节。后续问题直接更新对应页面。</footer></main></div></body></html>
