@@ -1,5 +1,5 @@
 """
-Small vLLM helpers for server lifecycle, completion requests, and NCCL weight sync.
+Small vLLM helpers for server lifecycle, completions, and NCCL/HCCL weight sync.
 """
 
 import atexit
@@ -30,7 +30,7 @@ class VLLMServer:
     model_id: str
     host: str = "127.0.0.1"
     port: int = 8000
-    gpu: int = 1
+    gpu: int = 1  # Physical accelerator index, including for device_type="npu".
     seed: int = 0
     load_format: str = "auto"
     logging_level: str = "ERROR"
@@ -38,8 +38,11 @@ class VLLMServer:
     launch_server: bool = True
     startup_timeout: int = 600
     shutdown_timeout: int = 30
+    device_type: str = "cuda"
 
     def __post_init__(self) -> None:
+        if self.device_type not in ("cuda", "npu"):
+            raise ValueError("device_type must be 'cuda' or 'npu'.")
         self.base_url = f"http://{self.host}:{self.port}"
         self.process = None
         self.weight_sync_group = None
@@ -56,6 +59,7 @@ class VLLMServer:
                 load_format=self.load_format,
                 logging_level=self.logging_level,
                 gpu_memory_utilization=self.gpu_memory_utilization,
+                device_type=self.device_type,
             )
             atexit.register(self.stop)
         wait_for_server(self.base_url, self.process, self.startup_timeout)
@@ -122,9 +126,17 @@ def start_server(
     load_format: str,
     logging_level: str,
     gpu_memory_utilization: float = 0.9,
+    device_type: str = "cuda",
 ) -> subprocess.Popen:
+    """Launch matching vLLM releases with their official NCCL/HCCL backends."""
+    if device_type not in ("cuda", "npu"):
+        raise ValueError("device_type must be 'cuda' or 'npu'.")
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    if device_type == "npu":
+        env["ASCEND_RT_VISIBLE_DEVICES"] = str(gpu)
+        env["VLLM_ASCEND_ENABLE_NZ"] = "0"
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["VLLM_SERVER_DEV_MODE"] = "1"
     env["VLLM_LOGGING_LEVEL"] = logging_level
     command = [
@@ -145,7 +157,7 @@ def start_server(
         "--tensor-parallel-size",
         "1",
         "--weight-transfer-config",
-        json.dumps({"backend": "nccl"}),
+        json.dumps({"backend": "hccl" if device_type == "npu" else "nccl"}),
         "--load-format",
         load_format,
     ]
@@ -220,8 +232,15 @@ def generate_completions(
 
 
 def init_weight_sync(vllm_base_url: str, policy_device: str):
-    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
     from vllm.utils.network_utils import get_ip, get_open_port
+
+    device = torch.device(policy_device)
+    if device.type == "npu":
+        from vllm_ascend.distributed.weight_transfer.hccl_engine import HCCLWeightTransferEngine as TransferEngine
+        torch.npu.set_device(device)
+    else:
+        from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine as TransferEngine
+        torch.cuda.set_device(device)
 
     inference_world_size = _http_json("GET", f"{vllm_base_url}/get_world_size", timeout=10)["world_size"]
     world_size = inference_world_size + 1
@@ -234,7 +253,6 @@ def init_weight_sync(vllm_base_url: str, policy_device: str):
         "world_size": world_size,
     }
 
-    torch.cuda.set_device(torch.device(policy_device))
     with ThreadPoolExecutor(max_workers=1) as executor:
         init_future = executor.submit(
             _http_json,
@@ -243,7 +261,7 @@ def init_weight_sync(vllm_base_url: str, policy_device: str):
             {"init_info": init_info},
             60,
         )
-        weight_sync_group = NCCLWeightTransferEngine.trainer_init(
+        weight_sync_group = TransferEngine.trainer_init(
             {
                 "master_address": master_address,
                 "master_port": master_port,
@@ -257,21 +275,35 @@ def init_weight_sync(vllm_base_url: str, policy_device: str):
 
 def sync_policy_weights(policy: torch.nn.Module, vllm_base_url: str, weight_sync_group) -> None:
     """Copy policy weights into vLLM and invalidate caches derived from old weights."""
-    from vllm.distributed.weight_transfer.nccl_engine import (
-        NCCLTrainerSendWeightsArgs,
-        NCCLWeightTransferEngine,
-    )
+    device = next(policy.parameters()).device
+    if device.type == "npu":
+        from vllm_ascend.distributed.weight_transfer.hccl_engine import (
+            HCCLTrainerSendWeightsArgs as SendWeightsArgs,
+            HCCLWeightTransferEngine as TransferEngine,
+        )
+        torch.npu.set_device(device)
+    else:
+        from vllm.distributed.weight_transfer.nccl_engine import (
+            NCCLTrainerSendWeightsArgs as SendWeightsArgs,
+            NCCLWeightTransferEngine as TransferEngine,
+        )
+        torch.cuda.set_device(device)
+    # Both official engines support the same packed-transfer arguments.
+    packed = True
 
     weights = list(policy.named_parameters())
     update_info = {
         "names": [name for name, _ in weights],
         "dtype_names": [str(tensor.dtype).split(".")[-1] for _, tensor in weights],
         "shapes": [list(tensor.shape) for _, tensor in weights],
-        "packed": True,
+        "packed": packed,
     }
 
-    torch.cuda.set_device(next(policy.parameters()).device)
-    _http_json("POST", f"{vllm_base_url}/pause", timeout=60)
+    _http_json("POST", f"{vllm_base_url}/pause?mode=wait", timeout=60)
+    _http_json(
+        "POST", f"{vllm_base_url}/start_weight_update",
+        {"is_checkpoint_format": True}, timeout=60,
+    )
     with ThreadPoolExecutor(max_workers=1) as executor:
         update_future = executor.submit(
             _http_json,
@@ -280,13 +312,14 @@ def sync_policy_weights(policy: torch.nn.Module, vllm_base_url: str, weight_sync
             {"update_info": update_info},
             300,
         )
-        NCCLWeightTransferEngine.trainer_send_weights(
+        TransferEngine.trainer_send_weights(
             iterator=iter(weights),
-            trainer_args=NCCLTrainerSendWeightsArgs(
+            trainer_args=SendWeightsArgs(
                 group=weight_sync_group,
-                packed=True,
+                packed=packed,
             ),
         )
         update_future.result()
+    _http_json("POST", f"{vllm_base_url}/finish_weight_update", timeout=60)
     _http_json("POST", f"{vllm_base_url}/reset_prefix_cache", timeout=60)
     _http_json("POST", f"{vllm_base_url}/resume", timeout=60)
