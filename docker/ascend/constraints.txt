@@ -1,0 +1,18 @@
+# Keep the official Ascend release stack intact while installing project tools.
+vllm==0.23.0
+vllm-ascend==0.23.0
+torch==2.10.0
+torch-npu==2.10.0.post4
+torchvision==0.25.0
+transformers==5.5.4
+# Preserve the official Triton Ascend compiler's required NumPy/test versions.
+numpy==1.26.4
+opencv-python-headless==5.0.0.93
+prometheus-fastapi-instrumentator==7.1.0
+huggingface-hub==1.27.0
+accelerate==1.6.0
+datasets==4.4.1
+math-verify==0.7.0
+pytest==8.3.2
+pylatexenc==2.10
+xopen==2.0.2

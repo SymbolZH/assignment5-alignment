@@ -1,0 +1,12 @@
+# The compiled framework stack is supplied by the pinned official base image.
+prometheus-fastapi-instrumentator
+accelerate>=1.5.2
+math-verify[antlr4-13-2]>=0.7.0
+modal>=1.1.0
+pytest>=8.3.2
+pylatexenc>=2.10
+typer>=0.15.4
+xopen>=2.0.2
+wandb==0.26.0
+alpaca-eval>=0.6.6
+uv

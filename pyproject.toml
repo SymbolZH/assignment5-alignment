@@ -8,7 +8,8 @@ dependencies = [
     "accelerate>=1.5.2",
     "math-verify[antlr4-13-2]>=0.7.0",
     "modal>=1.1.0",
-    "pytest>=8.3.5",
+    "pytest>=8.3.2 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "pytest>=8.3.5 ; sys_platform != 'linux' or platform_machine != 'aarch64'",
     "pylatexenc>=2.10",
     "torch",
     "transformers>=4.50.0",
@@ -18,25 +19,48 @@ dependencies = [
 
 [project.optional-dependencies]
 npu = [
-    "torch==2.8.0",
-    "torch-npu==2.8.0",
+    # vLLM Ascend's validated combination for the installed CANN 8.3.RC1.
+    "torch==2.7.1 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "torch-npu==2.7.1 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "torchvision==0.22.1 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "vllm-ascend==0.11.0rc1 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "transformers==4.57.1 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "openai==2.7.2 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "fastapi==0.121.1 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "prometheus-fastapi-instrumentator==7.1.0 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "mistral-common==1.8.5 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "opencv-python-headless==4.11.0.86 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "numba==0.61.2 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
     # Python dependencies used by the system CANN toolkit.
-    "numpy>=1.26.4,<2",
-    "attrs",
-    "decorator",
-    "scipy",
-    "cloudpickle",
-    "ml-dtypes<0.6",  # 0.6+ requires NumPy 2
-    "tornado",
-    "absl-py",
+    "numpy>=1.26.4,<2 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "attrs ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "decorator ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "cffi ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "pathlib2 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "scipy ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "cloudpickle ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "ml-dtypes<0.6 ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",  # 0.6+ requires NumPy 2
+    "tornado ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+    "absl-py ; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.12'",
+]
+npu-container = [
+    # API version matches GPU; these are the official Ascend image's framework versions.
+    "vllm==0.23.0 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "vllm-ascend==0.23.0 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "torch==2.10.0 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "torch-npu==2.10.0.post4 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "transformers==5.5.4 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "wandb==0.26.0 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "alpaca-eval>=0.6.6 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 gpu = [
     "alpaca-eval>=0.6.6",
-    # No official flash-attn 2.8.3 wheel exists for Torch 2.10; use the
-    # community cp312/cu12/Torch 2.10 wheel to avoid source builds on Modal.
-    "flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "torch",
-    "vllm==0.19.1",
+    # Match vLLM's CUDA 13 / Torch 2.11 binaries; the community wheel avoids
+    # compiling FlashAttention on Modal (Python 3.12, NVIDIA/Linux x86_64).
+    "flash-attn @ https://github.com/alkemiik-coder/FlashAttention-2.8.3-Custom-Linux-Wheels/releases/download/FA.2.8.3-custom-linux-wheels-x86_64/flash_attn-2.8.3%2Bcu130torch2.11cxx11abiTRUEfullsm80sm90sm100sm120nvcc130-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
+    "torch==2.11.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "vllm==0.23.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "transformers==5.5.4",
     "wandb>=0.26.0",
 ]
 plots = [
@@ -48,6 +72,7 @@ include = ["cs336_alignment*"]
 
 [tool.uv]
 package = true
+conflicts = [[{ extra = "gpu" }, { extra = "npu" }, { extra = "npu-container" }]]
 environments = [
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -55,11 +80,11 @@ environments = [
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu129", extra = "gpu", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu130", extra = "gpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 [[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.pytest.ini_options]
