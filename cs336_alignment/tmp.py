@@ -17,11 +17,11 @@ for prompt_type in prompt_types:
 # 加载数据，从answer中提取gt
 def load_data():
     # question和gt两个key
-    with jsonlines.open('../data/gsm8k/train.jsonl') as reader:
+    with jsonlines.open('../data/gsm8k/test.jsonl') as reader:
         data_list = [{"question": data["question"],
                     "gt": data["answer"].split("#### ")[-1]} for data in list(reader)]
-    choosen_idx = list(range(10))
-    data_list = [data_list[idx] for idx in choosen_idx]
+    # choosen_idx = list(range(10))
+    # data_list = [data_list[idx] for idx in choosen_idx]
     return data_list
 
 def get_sampling_params(prompt_type):
@@ -99,16 +99,15 @@ def save_output(outputs_list, prompt_type, sampling_params):
 （1）格式和正确性奖励均为 1；（2）格式奖励为 1、正确性奖励为 0；（3）两项奖励均为 0。
 """
 
-
-
-prompt_type = "r1_zero"
-data_list = load_data()
-sampling_params = get_sampling_params(prompt_type)
 llm = vllm_utils.VLLMServer(model_id="../model/OLMo-2-0425-1B",
-                            device_type="npu")
-
+                                device_type="npu")
 llm.start()
 
-outputs_list = run_baseline(data_list, prompt_type, sampling_params)
+for prompt_type in prompt_types:
+    data_list = load_data()
+    sampling_params = get_sampling_params(prompt_type)
 
-save_output(outputs_list, prompt_type, sampling_params)
+
+    outputs_list = run_baseline(data_list, prompt_type, sampling_params)
+
+    save_output(outputs_list, prompt_type, sampling_params)
