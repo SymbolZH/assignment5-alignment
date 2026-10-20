@@ -43,7 +43,7 @@ wandb_secret = modal.Secret.from_name(WANDB_SECRET_NAME)
 
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.9.1-devel-ubuntu22.04",
+        "nvidia/cuda:13.0.2-devel-ubuntu22.04",
         add_python="3.12",
     )
     .uv_sync(extras=["gpu"])
