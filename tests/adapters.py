@@ -46,7 +46,45 @@ def run_tokenize_prompt_and_output(
                 with labels, with value 1 where the corresponding label token
                 is part of the response and 0 otherwise.
     """
-    raise NotImplementedError
+    prompts_tokenized = tokenizer(prompt_strs, return_tensors=None, padding=True)
+    prompts_token_ids, prompts_attention_mask = prompts_tokenized["input_ids"], prompts_tokenized["attention_mask"]
+
+    for idx, (prompt_token_ids, prompt_attention_mask) in enumerate(zip(prompts_token_ids, prompts_attention_mask)):
+        prompts_token_ids[idx] = prompt_token_ids[:sum(prompt_attention_mask)]
+        pass
+
+    outputs_tokenized = tokenizer(output_strs, return_tensors=None, padding=True)
+    outputs_token_ids, outputs_attention_mask = outputs_tokenized["input_ids"], outputs_tokenized["attention_mask"]
+
+    for idx, (output_token_ids, output_attention_mask) in enumerate(zip(outputs_token_ids, outputs_attention_mask)):
+        outputs_token_ids[idx] = output_token_ids[:sum(output_attention_mask)]
+
+
+    prompts_and_outputs_ids_list = []
+    prompts_and_outputs_attention_mask_list = []
+    for idx, (prompt_token_ids, prompt_attention_mask, output_token_ids, output_attention_mask) in enumerate(zip(prompts_token_ids, prompts_attention_mask, outputs_token_ids, outputs_attention_mask)):
+        prompts_and_outputs_ids_list.append(prompt_token_ids + output_token_ids)
+        prompts_and_outputs_attention_mask_list.append(sum(prompt_attention_mask) * [0] + sum(output_attention_mask) * [1])
+
+    print(prompts_and_outputs_ids_list)
+    print(prompts_and_outputs_attention_mask_list)
+
+
+    prompt_and_outputs_ids, prompt_and_outputs_mask = tokenizer.pad({"input_ids": prompts_and_outputs_ids_list}, return_tensors="pt")["input_ids"], tokenizer.pad({"input_ids": prompts_and_outputs_ids_list}, return_tensors="pt")["attention_mask"]
+
+
+
+    for idx, attention_mask in enumerate(prompt_and_outputs_mask):
+        for j in range(sum(prompts_attention_mask[idx])):
+            prompt_and_outputs_mask[idx][j] = 0
+
+    # breakpoint()
+
+
+    return_dict =  {"input_ids": prompt_and_outputs_ids[:, :-1],
+                    "labels": prompt_and_outputs_ids[:, 1:],
+                    "response_mask": prompt_and_outputs_mask[:, 1:]}
+    return return_dict
 
 
 def run_get_response_log_probs(
