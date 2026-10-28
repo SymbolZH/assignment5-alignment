@@ -113,7 +113,16 @@ def run_get_response_log_probs(
                 entropy for each position (present only if
                 return_token_entropy=True).
     """
-    raise NotImplementedError
+    with torch.inference_mode():
+        output = model(input_ids)
+    output_probs = output.logits.softmax(dim=-1)
+    output_logprobs = output.logits.log_softmax(dim=-1)
+    log_probs = torch.gather(output_logprobs, dim=-1, index=labels.unsqueeze(dim=-1)).squeeze()
+    token_entropy = torch.sum(-output_logprobs * output_probs, dim=-1) if return_token_entropy else None
+
+    return {"log_probs": log_probs,
+            "token_entropy": token_entropy}
+        
 
 
 def run_compute_rollout_rewards(
