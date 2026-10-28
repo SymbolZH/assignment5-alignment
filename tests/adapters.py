@@ -115,10 +115,10 @@ def run_get_response_log_probs(
     """
     with torch.inference_mode():
         output = model(input_ids)
-    output_probs = output.logits.softmax(dim=-1)
-    output_logprobs = output.logits.log_softmax(dim=-1)
-    log_probs = torch.gather(output_logprobs, dim=-1, index=labels.unsqueeze(dim=-1)).squeeze()
-    token_entropy = torch.sum(-output_logprobs * output_probs, dim=-1) if return_token_entropy else None
+    vocab_probs = output.logits.softmax(dim=-1)
+    vocab_log_probs = output.logits.log_softmax(dim=-1)
+    log_probs = torch.gather(vocab_log_probs, dim=-1, index=labels.unsqueeze(dim=-1)).squeeze(dim=-1)
+    token_entropy = torch.sum(-vocab_probs * vocab_log_probs, dim=-1) if return_token_entropy else None
 
     return {"log_probs": log_probs,
             "token_entropy": token_entropy}
