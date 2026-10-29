@@ -201,7 +201,11 @@ def run_compute_group_normalized_rewards(
                 your choice of other statistics to log (e.g. mean, std, max/min
                 of rewards).
     """
-    raise NotImplementedError
+    raw_rewards = raw_rewards.reshape(-1, group_size)
+    reward_mean = raw_rewards.mean(-1, keepdim=True)
+    reward_std = raw_rewards.std(-1, keepdim=True, correction=1) + advantage_eps
+    metadata = {}
+    return ((raw_rewards - reward_mean) / reward_std ).reshape(-1,), metadata
 
 
 def run_compute_policy_gradient_loss(
