@@ -252,7 +252,8 @@ def run_compute_policy_gradient_loss(
                 Statistics from the underlying loss call, such as
                 clip-fraction components.
     """
-    raise NotImplementedError
+    raw_rewards_or_advantages = raw_rewards_or_advantages.reshape(-1, 1)
+    return -(raw_rewards_or_advantages * policy_log_probs), {}
 
 
 def run_aggregate_loss_across_microbatch(
@@ -284,6 +285,8 @@ def run_aggregate_loss_across_microbatch(
             A scalar containing the average loss. Make sure you can later call
             backward on this loss.
     """
+    masked_loss = per_token_policy_gradient_loss * mask
+    return (masked_loss.sum(dim=-1) / mask.sum(dim=-1) ).mean(dim=-1)
     raise NotImplementedError
 
 
