@@ -113,8 +113,7 @@ def run_get_response_log_probs(
                 entropy for each position (present only if
                 return_token_entropy=True).
     """
-    with torch.inference_mode():
-        output = model(input_ids)
+    output = model(input_ids)
     vocab_probs = output.logits.softmax(dim=-1)
     vocab_log_probs = output.logits.log_softmax(dim=-1)
     log_probs = torch.gather(vocab_log_probs, dim=-1, index=labels.unsqueeze(dim=-1)).squeeze(dim=-1)
@@ -376,7 +375,43 @@ def run_grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
-    raise NotImplementedError
+    input_ids = run_tokenize_prompt_and_output(prompt_strs=repeated_prompts, output_strs=rollout_responses, tokenizer=tokenizer)["input_ids"]
+    labels = run_tokenize_prompt_and_output(prompt_strs=repeated_prompts, output_strs=rollout_responses, tokenizer=tokenizer)["labels"]
+    response_mask = run_tokenize_prompt_and_output(prompt_strs=repeated_prompts, output_strs=rollout_responses, tokenizer=tokenizer)["response_mask"]
+    loss = 0
+
+    # 感觉这个还是写得有点丑，把t复制0或1是不是会更好一点
+    batch_size_list_mirco = [len(input_ids) // gradient_accumulation_steps + 1 \
+                        if t < len(input_ids) % gradient_accumulation_steps \
+                        else len(input_ids) // gradient_accumulation_steps for t in range(gradient_accumulation_steps)]
+
+
+    for i, batch_size_mirco in enumerate(batch_size_list_mirco):
+        # 一开始犹豫loss应该除以啥。但是也不对，因为后面每个mirco batch里面都已经取了mean。那现在应该怎么处理呢？
+        # 我疑问的对于batch nums为[3, 3, 2]的一个批次list，就是虽然我们每个batch都取了mean，但是这些micro batch累积的时候应该除以3吗？还是除多少？
+        start_index = sum(batch_size_list_mirco[:i])
+        # DONE:response_mask应该如何打mask？这个是在run_tokenize_prompt_and_output中实现了 
+        input_ids_mirco = input_ids[start_index:start_index + batch_size_mirco]
+        labels_micro = labels[start_index:start_index + batch_size_mirco]
+        response_mask_micro = response_mask[start_index:start_index + batch_size_mirco]
+
+        policy_log_probs = run_get_response_log_probs(model, input_ids_mirco, labels_micro, True)["log_probs"]
+        raw_scores,_ = run_compute_rollout_rewards(reward_fn=reward_fn, 
+                                                  rollout_responses=rollout_responses[start_index: start_index + batch_size_mirco],
+                                                  repeated_ground_truths=repeated_ground_truths[start_index: start_index + batch_size_mirco])
+        advantages,_ = run_compute_group_normalized_rewards(raw_scores, batch_size_mirco)
+
+        policy_gradient_loss,_ = run_compute_policy_gradient_loss(advantages, policy_log_probs)
+        # TODO: 我知道这个loss_micro需要除以一个东西，但是还是刚才的迷惑，除以len(input_ids) // gradient_accumulation_steps好像不够合理
+        loss_micro = run_aggregate_loss_across_microbatch(policy_gradient_loss, response_mask_micro) / gradient_accumulation_steps
+        loss += loss_micro
+        loss_micro.backward()
+    if max_grad_norm:
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+    optimizer.step()
+    optimizer.zero_grad()
+    metadata = {}
+    return loss , metadata
 
 
 """
