@@ -375,9 +375,10 @@ def run_grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
-    input_ids = run_tokenize_prompt_and_output(prompt_strs=repeated_prompts, output_strs=rollout_responses, tokenizer=tokenizer)["input_ids"]
-    labels = run_tokenize_prompt_and_output(prompt_strs=repeated_prompts, output_strs=rollout_responses, tokenizer=tokenizer)["labels"]
-    response_mask = run_tokenize_prompt_and_output(prompt_strs=repeated_prompts, output_strs=rollout_responses, tokenizer=tokenizer)["response_mask"]
+    device = model.device
+    input_ids = run_tokenize_prompt_and_output(prompt_strs=repeated_prompts, output_strs=rollout_responses, tokenizer=tokenizer)["input_ids"].to(device)
+    labels = run_tokenize_prompt_and_output(prompt_strs=repeated_prompts, output_strs=rollout_responses, tokenizer=tokenizer)["labels"].to(device)
+    response_mask = run_tokenize_prompt_and_output(prompt_strs=repeated_prompts, output_strs=rollout_responses, tokenizer=tokenizer)["response_mask"].to(device)
     loss = 0
 
     batch_size_list_mirco = [len(input_ids) // gradient_accumulation_steps + \
@@ -389,6 +390,7 @@ def run_grpo_train_step(
                                                repeated_ground_truths=repeated_ground_truths)
 
     advantages,_ = run_compute_group_normalized_rewards(raw_scores, group_size)
+    advantages = advantages.to(device)
     
     for i, batch_size_mirco in enumerate(batch_size_list_mirco):
         # 一开始犹豫loss应该除以啥。但是也不对，因为后面每个mirco batch里面都已经取了mean。那现在应该怎么处理呢？
