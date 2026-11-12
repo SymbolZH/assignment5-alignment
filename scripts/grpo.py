@@ -201,11 +201,12 @@ def main(args):
     model_path = args.model_path
     llm = VLLMServer(model_id=model_path, 
                      device_type="npu",
-                     gpu=1,
-                     seed=args.seed)
+                     gpu=6,
+                     seed=args.seed,
+                     port=18000)
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).to("npu:0")
+    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).to("npu:7")
     model.train()
     model.config.use_cache = False
     
@@ -222,7 +223,7 @@ def main(args):
     with SummaryWriter(log_dir=str(based_dir / "tensorboard"), flush_secs=10) as writer:
         try:
             llm.start()
-            llm.init_weight_sync("npu:0")
+            llm.init_weight_sync("npu:7")
             llm.sync_policy_weights(model)
 
             val_output_list = run_baseline(llm, val_set, prompt_type, get_val_sampling_params(args))
@@ -253,6 +254,8 @@ def main(args):
                                                     repeated_ground_truths=[item["gt"] for item in outputs_list_rollout_batch],
                                                     group_size=args.group_size)
                 writer.add_scalar("train/loss", loss.detach().item(), step_nums)
+                if metadata.get("grad_norm") is not None:
+                    writer.add_scalar("train/grad_norm", metadata["grad_norm"].item(), step_nums)
                 log_reward_metrics(writer, outputs_list_rollout_batch, step=step_nums, split="train")
                 llm.sync_policy_weights(model)
 

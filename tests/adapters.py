@@ -285,8 +285,11 @@ def run_aggregate_loss_across_microbatch(
             backward on this loss.
     """
     masked_loss = per_token_policy_gradient_loss * mask
-    return (masked_loss.sum(dim=-1) / mask.sum(dim=-1) ).mean(dim=-1)
-    raise NotImplementedError
+    # 空回复序列的 response_mask 全为 0，直接相除是 0/0=NaN：
+    # 一个 NaN 行会让整个 microbatch 的 loss 变 NaN，backward 后污染全部梯度，
+    # 一次 optimizer.step() 就会把所有权重写成 NaN。clamp(min=1) 让空序列贡献 0 loss。
+    sequence_loss = masked_loss.sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
+    return sequence_loss.mean(dim=-1)
 
 
 def run_grpo_train_step(
@@ -408,11 +411,16 @@ def run_grpo_train_step(
         loss_micro = run_aggregate_loss_across_microbatch(policy_gradient_loss, response_mask_micro) / gradient_accumulation_steps
         loss += loss_micro
         loss_micro.backward()
+    grad_norm = None
     if max_grad_norm:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        if not torch.isfinite(grad_norm):
+            # 梯度出现 NaN/Inf 时放弃本步更新，避免把整个模型权重写成 NaN
+            optimizer.zero_grad()
+            return loss, {"grad_norm": grad_norm.detach()}
     optimizer.step()
     optimizer.zero_grad()
-    metadata = {}
+    metadata = {"grad_norm": grad_norm.detach() if grad_norm is not None else None}
     return loss , metadata
 
 
