@@ -1,13 +1,15 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
 import random
-import jsonlines
 import argparse
+import jsonlines
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
 from cs336_alignment.vllm_utils import VLLMServer
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
+from cs336_alignment.prompting_and_eval import run_baseline, get_sampling_params, save_output
 from tests.adapters import run_grpo_train_step
-
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -127,33 +129,42 @@ def parse_args():
 
     return parser.parse_args()
 
-def get_sampling_params(args):
+
+# 仅仅是这里没有区分而已，但其实RL的train和val往往是不同的
+def get_val_sampling_params(args):
     # 采样参数
     sampling_temperature = args.sampling_temperature
     top_p = args.sampling_top_p
     max_tokens = args.sampling_max_tokens
+    n = 1
+    seed = None
     prompt_type = args.prompt_type
-    seed = args.seed
 
-    stop = ["</answer>"] if prompt_type != "question_only" else None
-    include_stop_str_in_output = True if prompt_type != "question_only" else False
-    sampling_params = {
-        "temperature": sampling_temperature,
-        "top_p": top_p,
-        "max_tokens": max_tokens,
-        "n": 1,
-        "seed": None,
-        "stop": stop,
-        "include_stop_str_in_output": include_stop_str_in_output
-    }
-    return sampling_params
+    return get_sampling_params(prompt_type,
+                               temperature=sampling_temperature,
+                               top_p=top_p,
+                               max_tokens=max_tokens,
+                               seed=seed,
+                               n=n)
 
-# 缓存的prompt模板
-prompt_types = ["question_only", "r1_zero_three_shot_gsm8k", "r1_zero"]
-templates = {}
-for prompt_type in prompt_types:
-    with open(f"./cs336_alignment/prompts/{prompt_type}.prompt", "r") as fin:
-        templates[prompt_type] = fin.read()
+
+def get_train_sampling_params(args):
+    # 采样参数
+    sampling_temperature = args.sampling_temperature
+    top_p = args.sampling_top_p
+    max_tokens = args.sampling_max_tokens
+    n = 1
+    seed = None
+    prompt_type = args.prompt_type
+
+    return get_sampling_params(prompt_type,
+                               temperature=sampling_temperature,
+                               top_p=top_p,
+                               max_tokens=max_tokens,
+                               seed=seed,
+                               n=n)
+
+
 
 
 # 加载训练数据，从answer中提取gt，并且切分训练集和验证集
@@ -178,6 +189,7 @@ def main(args):
                      device_type="npu",
                      gpu=1,
                      seed=args.seed)
+
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).to("npu:0")
     model.train()
@@ -186,54 +198,61 @@ def main(args):
     optimizer = torch.optim.AdamW(model.parameters(), 
                                   lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=0.0)
     train_set, val_set = load_train_data(args)
-    sampling_params = get_sampling_params(args)
     prompt_type = args.prompt_type
     llm.start()
     llm.init_weight_sync("npu:0")
+    llm.sync_policy_weights(model)
+
+    beijing_tz = timezone(timedelta(hours=8))
+    timestap = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M%S")
+    based_dir = Path(__file__).parents[1] / "grpo_training" / f'{timestap}'
+    based_dir.mkdir(parents=True, exist_ok=True)
+
+    val_output_list = run_baseline(llm, val_set, prompt_type, get_val_sampling_params(args))
+    save_output(val_output_list, based_dir / f"val-0-steps")
 
     # 取出若干个进行rollout，然后计算梯度进行优化
     rollout_query_nums = args.rollout_batch_size // args.group_size
     for start_idx in range(0, len(train_set), rollout_query_nums):
+        step_nums = start_idx // rollout_query_nums + 1
         end_idx = min(start_idx + rollout_query_nums, len(train_set))
         rollout_batch = train_set[start_idx: end_idx]
-
         rollout_batch = [item for item in rollout_batch for _ in range(args.group_size)]
-        llm.sync_policy_weights(model)
 
-        # 放采样的内容
-        outputs_list_rollout_batch = []
-        prompts_list_rollout_batch = [templates[prompt_type].format(question=data["question"]) for data in rollout_batch]
-        gts_list_rollout_batch = [data["gt"] for data in rollout_batch]
-        responses_rollout_batch = llm.generate_completions(prompts=prompts_list_rollout_batch, 
-                                                           sampling_params=sampling_params)
-        llm_outputs_list_rollout_batch = [response.text for response in responses_rollout_batch ]
+
+        outputs_list_rollout_batch = run_baseline(llm, rollout_batch, prompt_type, get_train_sampling_params(args))
+        save_output(outputs_list_rollout_batch, based_dir / f"train-{step_nums}-steps")
         reward_fn = question_only_reward_fn if prompt_type == "question_only" else r1_zero_reward_fn
-        judge_result_rollout_batch = [reward_fn(output, gt) for output, gt in zip(llm_outputs_list_rollout_batch, gts_list_rollout_batch)]
-        for idx, data in enumerate(rollout_batch):
-            final_output_dict = {}
-            final_output_dict["question"] = rollout_batch[idx]["question"]
-            final_output_dict["gt"] = rollout_batch[idx]["gt"]
-
-            final_output_dict["prompt"] = prompts_list_rollout_batch[idx]
-            final_output_dict["output"] = llm_outputs_list_rollout_batch[idx]
-            final_output_dict["judge_result"] =judge_result_rollout_batch[idx]
-            outputs_list_rollout_batch.append(final_output_dict)
         # 占用卡的位置应该如何解决？目前暂时没有涉及卡
         # 然后优化后的模型权重没有进行存储和加载
-        run_grpo_train_step(model=model,
-                            tokenizer=tokenizer,
-                            optimizer=optimizer,
-                            gradient_accumulation_steps=args.gradient_accumulation_steps,
-                            max_grad_norm=args.max_grad_norm,
-                            reward_fn=reward_fn,
-                            repeated_prompts=[item["prompt"] for item in outputs_list_rollout_batch],
-                            rollout_responses=[item["output"] for item in outputs_list_rollout_batch],
-                            repeated_ground_truths=[item["gt"] for item in outputs_list_rollout_batch],
-                            group_size=args.group_size)
+        loss, metadata = run_grpo_train_step(model=model,
+                                            tokenizer=tokenizer,
+                                            optimizer=optimizer,
+                                            gradient_accumulation_steps=args.gradient_accumulation_steps,
+                                            max_grad_norm=args.max_grad_norm,
+                                            reward_fn=reward_fn,
+                                            repeated_prompts=[item["prompt"] for item in outputs_list_rollout_batch],
+                                            rollout_responses=[item["output"] for item in outputs_list_rollout_batch],
+                                            repeated_ground_truths=[item["gt"] for item in outputs_list_rollout_batch],
+                                            group_size=args.group_size)
+        llm.sync_policy_weights(model)
+        # 每20步就评测一下结果
+        if step_nums % 20 == 0:
+            val_output_list = run_baseline(llm, val_set, prompt_type, get_val_sampling_params(args))
+            save_output(val_output_list, based_dir / f"val-{step_nums}-steps")
 
+            checkpoint_dir = based_dir / f"checkpoint/step-{step_nums}"
+            model.save_pretrained(checkpoint_dir)
+            tokenizer.save_pretrained(checkpoint_dir)
+
+    # 最后也评估一次
+    val_output_list = run_baseline(llm, val_set, prompt_type, get_val_sampling_params(args))
+    save_output(val_output_list, based_dir / "final-steps-val")
+
+    checkpoint_dir = based_dir / "checkpoint/step-final"
+    model.save_pretrained(checkpoint_dir)
+    tokenizer.save_pretrained(checkpoint_dir)
 
 if __name__ == "__main__":
     args = parse_args()
-    print(args)
-    print(get_sampling_params(args))
     main(args)
