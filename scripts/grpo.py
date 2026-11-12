@@ -5,6 +5,7 @@ import jsonlines
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from torch.utils.tensorboard import SummaryWriter
 
 from cs336_alignment.vllm_utils import VLLMServer
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
@@ -181,6 +182,19 @@ def load_train_data(args):
     val_set = train_dataset_list[n_train_example: n_train_example + n_val_example]
     return train_set, val_set
 
+def log_reward_metrics(writer, outputs_list, step, split):
+    """Record mean reward, answer accuracy, and format rate for a rollout."""
+    if not outputs_list:
+        return
+    for metric, reward_key in (
+        ("reward", "reward"),
+        ("accuracy", "answer_reward"),
+        ("format_rate", "format_reward"),
+    ):
+        value = sum(output["judge_result"][reward_key] for output in outputs_list) / len(outputs_list)
+        writer.add_scalar(f"{split}/{metric}", value, step)
+
+
 def main(args):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -199,59 +213,71 @@ def main(args):
                                   lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=0.0)
     train_set, val_set = load_train_data(args)
     prompt_type = args.prompt_type
-    llm.start()
-    llm.init_weight_sync("npu:0")
-    llm.sync_policy_weights(model)
 
     beijing_tz = timezone(timedelta(hours=8))
-    timestap = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M%S")
-    based_dir = Path(__file__).parents[1] / "grpo_training" / f'{timestap}'
-    based_dir.mkdir(parents=True, exist_ok=True)
+    timestap = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M%S_%f")
+    based_dir = Path(__file__).resolve().parents[1] / "grpo_training" / timestap
+    based_dir.mkdir(parents=True, exist_ok=False)
 
-    val_output_list = run_baseline(llm, val_set, prompt_type, get_val_sampling_params(args))
-    save_output(val_output_list, based_dir / f"val-0-steps")
+    with SummaryWriter(log_dir=str(based_dir / "tensorboard"), flush_secs=10) as writer:
+        try:
+            llm.start()
+            llm.init_weight_sync("npu:0")
+            llm.sync_policy_weights(model)
 
-    # 取出若干个进行rollout，然后计算梯度进行优化
-    rollout_query_nums = args.rollout_batch_size // args.group_size
-    for start_idx in range(0, len(train_set), rollout_query_nums):
-        step_nums = start_idx // rollout_query_nums + 1
-        end_idx = min(start_idx + rollout_query_nums, len(train_set))
-        rollout_batch = train_set[start_idx: end_idx]
-        rollout_batch = [item for item in rollout_batch for _ in range(args.group_size)]
-
-
-        outputs_list_rollout_batch = run_baseline(llm, rollout_batch, prompt_type, get_train_sampling_params(args))
-        save_output(outputs_list_rollout_batch, based_dir / f"train-{step_nums}-steps")
-        reward_fn = question_only_reward_fn if prompt_type == "question_only" else r1_zero_reward_fn
-        # 占用卡的位置应该如何解决？目前暂时没有涉及卡
-        # 然后优化后的模型权重没有进行存储和加载
-        loss, metadata = run_grpo_train_step(model=model,
-                                            tokenizer=tokenizer,
-                                            optimizer=optimizer,
-                                            gradient_accumulation_steps=args.gradient_accumulation_steps,
-                                            max_grad_norm=args.max_grad_norm,
-                                            reward_fn=reward_fn,
-                                            repeated_prompts=[item["prompt"] for item in outputs_list_rollout_batch],
-                                            rollout_responses=[item["output"] for item in outputs_list_rollout_batch],
-                                            repeated_ground_truths=[item["gt"] for item in outputs_list_rollout_batch],
-                                            group_size=args.group_size)
-        llm.sync_policy_weights(model)
-        # 每20步就评测一下结果
-        if step_nums % 20 == 0:
             val_output_list = run_baseline(llm, val_set, prompt_type, get_val_sampling_params(args))
-            save_output(val_output_list, based_dir / f"val-{step_nums}-steps")
+            save_output(val_output_list, based_dir / "val-0-steps")
+            log_reward_metrics(writer, val_output_list, step=0, split="val")
+            last_eval_step = 0
 
-            checkpoint_dir = based_dir / f"checkpoint/step-{step_nums}"
+            # 取出若干个进行rollout，然后计算梯度进行优化
+            rollout_query_nums = args.rollout_batch_size // args.group_size
+            step_nums = 0
+            for start_idx in range(0, len(train_set), rollout_query_nums):
+                step_nums = start_idx // rollout_query_nums + 1
+                end_idx = min(start_idx + rollout_query_nums, len(train_set))
+                rollout_batch = train_set[start_idx: end_idx]
+                rollout_batch = [item for item in rollout_batch for _ in range(args.group_size)]
+
+                outputs_list_rollout_batch = run_baseline(llm, rollout_batch, prompt_type, get_train_sampling_params(args))
+                save_output(outputs_list_rollout_batch, based_dir / f"train-{step_nums}-steps")
+                reward_fn = question_only_reward_fn if prompt_type == "question_only" else r1_zero_reward_fn
+                loss, metadata = run_grpo_train_step(model=model,
+                                                    tokenizer=tokenizer,
+                                                    optimizer=optimizer,
+                                                    gradient_accumulation_steps=args.gradient_accumulation_steps,
+                                                    max_grad_norm=args.max_grad_norm,
+                                                    reward_fn=reward_fn,
+                                                    repeated_prompts=[item["prompt"] for item in outputs_list_rollout_batch],
+                                                    rollout_responses=[item["output"] for item in outputs_list_rollout_batch],
+                                                    repeated_ground_truths=[item["gt"] for item in outputs_list_rollout_batch],
+                                                    group_size=args.group_size)
+                writer.add_scalar("train/loss", loss.detach().item(), step_nums)
+                log_reward_metrics(writer, outputs_list_rollout_batch, step=step_nums, split="train")
+                llm.sync_policy_weights(model)
+
+                # 每20步评测并保存模型
+                if step_nums % 20 == 0:
+                    val_output_list = run_baseline(llm, val_set, prompt_type, get_val_sampling_params(args))
+                    save_output(val_output_list, based_dir / f"val-{step_nums}-steps")
+                    log_reward_metrics(writer, val_output_list, step=step_nums, split="val")
+                    last_eval_step = step_nums
+
+                    checkpoint_dir = based_dir / f"checkpoint/step-{step_nums}"
+                    model.save_pretrained(checkpoint_dir)
+                    tokenizer.save_pretrained(checkpoint_dir)
+
+            # 最后一步若已评估，复用结果，避免同一步记录两组验证指标
+            if step_nums != last_eval_step:
+                val_output_list = run_baseline(llm, val_set, prompt_type, get_val_sampling_params(args))
+                log_reward_metrics(writer, val_output_list, step=step_nums, split="val")
+            save_output(val_output_list, based_dir / "final-steps-val")
+
+            checkpoint_dir = based_dir / "checkpoint/step-final"
             model.save_pretrained(checkpoint_dir)
             tokenizer.save_pretrained(checkpoint_dir)
-
-    # 最后也评估一次
-    val_output_list = run_baseline(llm, val_set, prompt_type, get_val_sampling_params(args))
-    save_output(val_output_list, based_dir / "final-steps-val")
-
-    checkpoint_dir = based_dir / "checkpoint/step-final"
-    model.save_pretrained(checkpoint_dir)
-    tokenizer.save_pretrained(checkpoint_dir)
+        finally:
+            llm.stop()
 
 if __name__ == "__main__":
     args = parse_args()

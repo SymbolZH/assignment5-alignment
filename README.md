@@ -144,3 +144,24 @@ Initially, all tests should fail with `NotImplementedError`s.
 To connect your implementation to the tests, complete the
 functions in [./tests/adapters.py](./tests/adapters.py).
 
+## GRPO training curves
+
+`scripts/grpo.py` writes TensorBoard events to
+`grpo_training/<run_timestamp>/tensorboard/`. Each update records `train/loss`,
+`train/reward`, `train/accuracy`, and `train/format_rate`. Validation records
+`val/reward`, `val/accuracy`, and `val/format_rate` before training (step 0),
+every 20 updates, and after the final update. A final update already evaluated
+at a periodic interval reuses that result. Reward metrics are means over the
+generated responses; accuracy is the mean answer reward.
+
+From the host project directory, start TensorBoard in the development container:
+
+```sh
+bash scripts/ascend_container.sh exec tensorboard --logdir grpo_training --port 6006
+```
+
+Open `http://localhost:6006`. For a remote development machine, forward port
+6006 to your browser's machine. Pointing TensorBoard at `grpo_training` shows
+all recorded runs for comparison. The writer flushes buffered events every
+10 seconds and closes on both completion and exceptions.
+

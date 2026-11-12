@@ -11,6 +11,7 @@ dependencies = [
     "pytest>=8.3.2 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
     "pytest>=8.3.5 ; sys_platform != 'linux' or platform_machine != 'aarch64'",
     "pylatexenc>=2.10",
+    "tensorboard==2.20.0",
     "torch",
     "transformers>=4.50.0",
     "typer>=0.15.4",
